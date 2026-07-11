@@ -8,6 +8,7 @@ use wgpu::util::DeviceExt;
 const SHADER: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
+    // xyz: eye position; w: per-priority clip-space depth bias (see vs_main).
     eye: vec4<f32>,
     // x: selected surface id + 1 (0 = none)
     misc: vec4<u32>,
@@ -20,6 +21,7 @@ struct VsIn {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) id: u32,
+    @location(4) priority: u32,
 };
 
 struct VsOut {
@@ -34,6 +36,14 @@ struct VsOut {
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip = u.view_proj * vec4<f32>(in.pos, 1.0);
+    // Depth-bias coplanar overlaps (window on wall, floor on the ceiling
+    // below) so the higher-priority type wins instead of z-fighting.
+    // Subtracting a constant c from clip.z shifts NDC depth by c/w, i.e. a
+    // world-space pull toward the camera proportional to view distance; the
+    // CPU sets eye.w = k * near so that pull is ~k*distance (sub-pixel).
+    // Scaling by w instead would be a constant NDC shift, which dwarfs the
+    // depth gap between whole surfaces and breaks occlusion.
+    out.clip.z -= f32(in.priority) * u.eye.w;
     out.world = in.pos;
     out.normal = in.normal;
     out.color = in.color;
@@ -70,6 +80,8 @@ pub struct Vertex {
     pub normal: [f32; 3],
     pub color: [f32; 4],
     pub id: u32,
+    /// Depth-bias priority (SurfaceType::depth_priority); 0 for overlays.
+    pub priority: u32,
 }
 
 #[repr(C)]
@@ -117,18 +129,21 @@ pub fn build_mesh(model: &Model) -> (Vec<Vertex>, Vec<Vertex>, Vec<SurfaceIndice
     for (id, s) in model.surfaces.iter().enumerate() {
         let base = verts.len() as u32;
         let color = s.stype.color();
+        let priority = s.stype.depth_priority();
         for v in &s.verts {
             verts.push(Vertex {
                 pos: (*v).into(),
                 normal: s.normal.into(),
                 color,
                 id: id as u32,
+                priority,
             });
             edge_verts.push(Vertex {
                 pos: (*v).into(),
                 normal: s.normal.into(),
                 color: EDGE_COLOR,
                 id: id as u32,
+                priority,
             });
         }
         let tris = s.tris.iter().map(|i| base + i).collect();
@@ -182,7 +197,7 @@ impl SceneRenderer {
         let vbuf_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Uint32],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Uint32, 4 => Uint32],
         };
 
         let blend = wgpu::BlendState::ALPHA_BLENDING;

@@ -37,8 +37,12 @@ impl OrbitCamera {
         glam::camera::rh::view::look_at_mat4(self.eye(), self.target, Vec3::Z)
     }
 
+    pub fn near(&self) -> f32 {
+        (self.distance * 0.001).max(0.01)
+    }
+
     pub fn proj(&self, aspect: f32) -> Mat4 {
-        let near = (self.distance * 0.001).max(0.01);
+        let near = self.near();
         let far = (self.distance * 100.0).max(1000.0);
         glam::camera::rh::proj::directx::perspective(self.fov_y, aspect.max(0.01), near, far)
     }
@@ -48,7 +52,7 @@ impl OrbitCamera {
     }
 
     pub fn orbit(&mut self, dx: f32, dy: f32) {
-        self.yaw += dx * 0.008;
+        self.yaw -= dx * 0.008;
         self.pitch = (self.pitch + dy * 0.008).clamp(-1.55, 1.55);
     }
 

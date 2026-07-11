@@ -16,6 +16,9 @@ pub struct App {
     camera: OrbitCamera,
     type_visible: std::collections::BTreeMap<SurfaceType, bool>,
     type_counts: std::collections::BTreeMap<SurfaceType, usize>,
+    /// Unique zone names, sorted. `None` filter = all zones.
+    zones: Vec<String>,
+    zone_filter: Option<String>,
     regex_text: String,
     regex: Option<regex::Regex>,
     regex_error: Option<String>,
@@ -78,6 +81,15 @@ impl App {
         }
         let type_visible = SurfaceType::ALL.iter().map(|&t| (t, true)).collect();
 
+        let mut zones: Vec<String> = model
+            .surfaces
+            .iter()
+            .filter(|s| !s.zone.is_empty())
+            .map(|s| s.zone.clone())
+            .collect();
+        zones.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        zones.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
         let mut camera = OrbitCamera::default();
         camera.fit(scene_min, scene_max);
 
@@ -88,6 +100,8 @@ impl App {
             camera,
             type_visible,
             type_counts,
+            zones,
+            zone_filter: None,
             regex_text: String::new(),
             regex: None,
             regex_error: None,
@@ -112,6 +126,11 @@ impl App {
     fn surface_visible(&self, s: &Surface) -> bool {
         if !self.type_visible.get(&s.stype).copied().unwrap_or(true) {
             return false;
+        }
+        if let Some(zone) = &self.zone_filter {
+            if !s.zone.eq_ignore_ascii_case(zone) {
+                return false;
+            }
         }
         match &self.regex {
             Some(re) => re.is_match(&s.name),
@@ -188,11 +207,15 @@ impl App {
         let ndc_x = 2.0 * (pos.x - rect.left()) / rect.width() - 1.0;
         let ndc_y = 1.0 - 2.0 * (pos.y - rect.top()) / rect.height();
         let (orig, dir) = self.camera.ray(ndc_x, ndc_y, rect.aspect_ratio());
-        let mut best: Option<(f32, usize)> = None;
+        // Near-tie epsilon so coplanar overlaps pick the same surface the
+        // renderer shows in front (see SurfaceType::depth_priority).
+        const TIE_EPS: f32 = 1e-3;
+        let mut best: Option<(f32, u32, usize)> = None;
         for (i, (s, &vis)) in self.model.surfaces.iter().zip(&self.visible).enumerate() {
             if !vis {
                 continue;
             }
+            let pri = s.stype.depth_priority();
             for tri in s.tris.chunks_exact(3) {
                 let (a, b, c) = (
                     s.verts[tri[0] as usize],
@@ -200,13 +223,19 @@ impl App {
                     s.verts[tri[2] as usize],
                 );
                 if let Some(t) = ray_triangle(orig, dir, a, b, c) {
-                    if best.map_or(true, |(bt, _)| t < bt) {
-                        best = Some((t, i));
+                    let better = match best {
+                        None => true,
+                        Some((bt, bp, _)) => {
+                            t < bt - TIE_EPS || ((t - bt).abs() <= TIE_EPS && pri > bp)
+                        }
+                    };
+                    if better {
+                        best = Some((t, pri, i));
                     }
                 }
             }
         }
-        best.map(|(_, i)| i)
+        best.map(|(_, _, i)| i)
     }
 
     /// Overlay line list: world axes + normal arrow for the selection.
@@ -219,6 +248,7 @@ impl App {
                     normal: [0.0, 0.0, 1.0],
                     color,
                     id: OVERLAY_ID,
+                    priority: 0,
                 });
             }
         };
@@ -291,6 +321,32 @@ impl App {
             });
         }
         ui.separator();
+
+        if !self.zones.is_empty() {
+            ui.strong("Zone");
+            let zones = self.zones.clone();
+            egui::ComboBox::from_id_salt("zone_filter")
+                .width(ui.available_width())
+                .selected_text(self.zone_filter.as_deref().unwrap_or("All zones"))
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(&mut self.zone_filter, None, "All zones")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    for z in zones {
+                        let label = z.clone();
+                        if ui
+                            .selectable_value(&mut self.zone_filter, Some(z), label)
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+            ui.separator();
+        }
 
         ui.strong("Filter (regex, case-insensitive)");
         let mut text = self.regex_text.clone();
@@ -475,9 +531,12 @@ impl App {
         // --- draw ---
         let aspect = rect.aspect_ratio();
         let eye = self.camera.eye();
+        // Per-priority depth bias: k * near in clip space = a pull toward the
+        // camera of ~k * view distance (see vs_main in scene.rs).
+        let depth_bias = 1e-3 * self.camera.near();
         let uniforms = Uniforms {
             view_proj: self.camera.view_proj(aspect).to_cols_array_2d(),
-            eye: [eye.x, eye.y, eye.z, 1.0],
+            eye: [eye.x, eye.y, eye.z, depth_bias],
             misc: [self.selected.map_or(0, |i| i as u32 + 1), 0, 0, 0],
         };
         let visibility = self.visibility_dirty.then(|| self.visible.clone());

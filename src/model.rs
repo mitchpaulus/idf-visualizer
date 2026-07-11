@@ -58,6 +58,17 @@ impl SurfaceType {
         matches!(self, SurfaceType::Window | SurfaceType::Shading)
     }
 
+    /// Draw-order tie-break for coplanar overlaps: higher priority renders in
+    /// front (window/door beat their host wall, a floor beats the ceiling of
+    /// the zone below).
+    pub fn depth_priority(self) -> u32 {
+        match self {
+            SurfaceType::Window | SurfaceType::Door => 2,
+            SurfaceType::Floor | SurfaceType::Roof => 1,
+            SurfaceType::Wall | SurfaceType::Ceiling | SurfaceType::Shading => 0,
+        }
+    }
+
     fn from_idf(s: &str) -> SurfaceType {
         match s.to_ascii_lowercase().as_str() {
             "wall" => SurfaceType::Wall,

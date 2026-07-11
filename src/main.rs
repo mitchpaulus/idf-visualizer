@@ -1,3 +1,4 @@
+mod analysis;
 mod app;
 mod camera;
 mod idf;
@@ -41,8 +42,14 @@ fn main() -> eframe::Result {
         println!("warning: {w}");
     }
     for s in &m.surfaces {
-        for w in &s.warnings {
-            println!("surface \"{}\": {}", s.name, w);
+        for p in &s.problems {
+            println!(
+                "surface \"{}\" [{} · {}]: {}",
+                s.name,
+                p.severity.label(),
+                p.kind.label(),
+                p.message
+            );
         }
     }
     if info_only {

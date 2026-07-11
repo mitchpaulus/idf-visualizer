@@ -1,7 +1,7 @@
 //! egui application: viewport, side panels, selection, filtering, demo mode.
 
 use crate::camera::{ray_triangle, OrbitCamera};
-use crate::model::{Model, Surface, SurfaceType};
+use crate::model::{Model, ProblemKind, Severity, Surface, SurfaceType};
 use crate::scene::{self, SceneRenderer, Uniforms, Vertex, ViewCallback};
 use eframe::{egui, egui_wgpu};
 use egui::{Color32, RichText};
@@ -9,6 +9,73 @@ use glam::Vec3;
 use std::path::PathBuf;
 
 const OVERLAY_ID: u32 = u32::MAX;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorMode {
+    Type,
+    Zone,
+    Boundary,
+    Problems,
+}
+
+impl ColorMode {
+    const ALL: [ColorMode; 4] = [
+        ColorMode::Type,
+        ColorMode::Zone,
+        ColorMode::Boundary,
+        ColorMode::Problems,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ColorMode::Type => "Surface type",
+            ColorMode::Zone => "Zone",
+            ColorMode::Boundary => "Boundary",
+            ColorMode::Problems => "Problems",
+        }
+    }
+}
+
+fn severity_color(sev: Severity) -> Color32 {
+    match sev {
+        Severity::Error => Color32::from_rgb(220, 70, 70),
+        Severity::Warning => Color32::from_rgb(235, 185, 50),
+        Severity::Info => Color32::from_rgb(100, 150, 220),
+    }
+}
+
+fn hsv(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let h = (h.fract() + 1.0).fract() * 6.0;
+    let f = h - h.floor();
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    match h as i32 % 6 {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
+    }
+}
+
+fn boundary_color(boundary: &str) -> [f32; 3] {
+    let b = boundary.to_ascii_lowercase();
+    if b.is_empty() {
+        [0.55, 0.55, 0.55]
+    } else if b == "outdoors" {
+        [0.35, 0.62, 0.90]
+    } else if b.starts_with("ground") {
+        [0.58, 0.44, 0.28]
+    } else if b == "surface" {
+        [0.42, 0.72, 0.42]
+    } else if b == "zone" {
+        [0.30, 0.68, 0.68]
+    } else if b == "adiabatic" {
+        [0.80, 0.45, 0.80]
+    } else {
+        [0.90, 0.60, 0.30]
+    }
+}
 
 pub struct App {
     model: Model,
@@ -19,6 +86,13 @@ pub struct App {
     /// Unique zone names, sorted. `None` filter = all zones.
     zones: Vec<String>,
     zone_filter: Option<String>,
+    color_mode: ColorMode,
+    colors_dirty: bool,
+    /// When set, only surfaces with an enabled problem kind are shown.
+    problem_only: bool,
+    problem_kind_enabled: std::collections::BTreeMap<ProblemKind, bool>,
+    /// (kind, number of surfaces with it), for kinds present in the model.
+    problem_counts: Vec<(ProblemKind, usize)>,
     regex_text: String,
     regex: Option<regex::Regex>,
     regex_error: Option<String>,
@@ -90,6 +164,19 @@ impl App {
         zones.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
         zones.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 
+        let mut kind_counts: std::collections::BTreeMap<ProblemKind, usize> =
+            std::collections::BTreeMap::new();
+        for s in &model.surfaces {
+            let mut kinds: Vec<ProblemKind> = s.problems.iter().map(|p| p.kind).collect();
+            kinds.sort();
+            kinds.dedup();
+            for k in kinds {
+                *kind_counts.entry(k).or_insert(0) += 1;
+            }
+        }
+        let problem_kind_enabled = kind_counts.keys().map(|&k| (k, true)).collect();
+        let problem_counts: Vec<(ProblemKind, usize)> = kind_counts.into_iter().collect();
+
         let mut camera = OrbitCamera::default();
         camera.fit(scene_min, scene_max);
 
@@ -102,6 +189,11 @@ impl App {
             type_counts,
             zones,
             zone_filter: None,
+            color_mode: ColorMode::Type,
+            colors_dirty: false,
+            problem_only: false,
+            problem_kind_enabled,
+            problem_counts,
             regex_text: String::new(),
             regex: None,
             regex_error: None,
@@ -123,6 +215,78 @@ impl App {
         (self.scene_max - self.scene_min).length().max(1.0)
     }
 
+    fn has_enabled_problem(&self, s: &Surface) -> bool {
+        s.problems
+            .iter()
+            .any(|p| self.problem_kind_enabled.get(&p.kind).copied().unwrap_or(true))
+    }
+
+    /// Cycle the selection through visible surfaces with (enabled) problems.
+    fn select_next_problem(&mut self) {
+        let mut flagged = Vec::new();
+        for (i, (s, &vis)) in self.model.surfaces.iter().zip(&self.visible).enumerate() {
+            if vis
+                && s.problems
+                    .iter()
+                    .any(|p| self.problem_kind_enabled.get(&p.kind).copied().unwrap_or(true))
+            {
+                flagged.push(i);
+            }
+        }
+        let Some(&first) = flagged.first() else { return };
+        let next = match self.selected {
+            Some(cur) => flagged.iter().copied().find(|&i| i > cur).unwrap_or(first),
+            None => first,
+        };
+        self.select(Some(next));
+    }
+
+    /// One color per surface for the current color mode.
+    fn surface_colors(&self) -> Vec<[f32; 4]> {
+        self.model
+            .surfaces
+            .iter()
+            .map(|s| {
+                let alpha = s.stype.color()[3];
+                let rgb = match self.color_mode {
+                    ColorMode::Type => {
+                        let c = s.stype.color();
+                        [c[0], c[1], c[2]]
+                    }
+                    ColorMode::Zone => {
+                        if s.zone.is_empty() {
+                            [0.55, 0.55, 0.55]
+                        } else {
+                            let idx = self
+                                .zones
+                                .iter()
+                                .position(|z| z.eq_ignore_ascii_case(&s.zone))
+                                .unwrap_or(0);
+                            hsv(idx as f32 * 0.618_034, 0.55, 0.85)
+                        }
+                    }
+                    ColorMode::Boundary => {
+                        // Sub-surfaces inherit their base surface's boundary.
+                        let b = match s.base_surface {
+                            Some(bi) => &self.model.surfaces[bi].boundary,
+                            None => &s.boundary,
+                        };
+                        boundary_color(b)
+                    }
+                    ColorMode::Problems => {
+                        match s.problems.iter().map(|p| p.severity).max() {
+                            Some(Severity::Error) => [0.86, 0.25, 0.25],
+                            Some(Severity::Warning) => [0.92, 0.72, 0.18],
+                            Some(Severity::Info) => [0.36, 0.56, 0.85],
+                            None => [0.60, 0.60, 0.60],
+                        }
+                    }
+                };
+                [rgb[0], rgb[1], rgb[2], alpha]
+            })
+            .collect()
+    }
+
     fn surface_visible(&self, s: &Surface) -> bool {
         if !self.type_visible.get(&s.stype).copied().unwrap_or(true) {
             return false;
@@ -131,6 +295,9 @@ impl App {
             if !s.zone.eq_ignore_ascii_case(zone) {
                 return false;
             }
+        }
+        if self.problem_only && !self.has_enabled_problem(s) {
+            return false;
         }
         match &self.regex {
             Some(re) => re.is_match(&s.name),
@@ -295,6 +462,18 @@ impl App {
         if ui.button("Zoom to fit  (F)").clicked() {
             self.zoom_to_fit();
         }
+        ui.horizontal(|ui| {
+            ui.label("Color by");
+            egui::ComboBox::from_id_salt("color_mode")
+                .selected_text(self.color_mode.label())
+                .show_ui(ui, |ui| {
+                    for m in ColorMode::ALL {
+                        if ui.selectable_value(&mut self.color_mode, m, m.label()).changed() {
+                            self.colors_dirty = true;
+                        }
+                    }
+                });
+        });
         ui.separator();
 
         ui.strong("Surface types");
@@ -363,30 +542,63 @@ impl App {
         }
         ui.separator();
 
-        let warn_count: usize = self
-            .model
-            .surfaces
-            .iter()
-            .filter(|s| !s.warnings.is_empty())
-            .count();
-        if warn_count > 0 {
+        if !self.problem_counts.is_empty() {
+            ui.strong("Problems");
+            if ui
+                .checkbox(&mut self.problem_only, "Show only flagged surfaces")
+                .changed()
+            {
+                changed = true;
+            }
+            let counts = self.problem_counts.clone();
+            for (kind, count) in counts {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        rect.center(),
+                        4.0,
+                        severity_color(kind.default_severity()),
+                    );
+                    let enabled = self.problem_kind_enabled.get_mut(&kind).unwrap();
+                    if ui
+                        .checkbox(enabled, format!("{} ({count})", kind.label()))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+            }
+            let flagged: Vec<(usize, String)> = self
+                .model
+                .surfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| self.has_enabled_problem(s))
+                .map(|(i, s)| (i, s.name.clone()))
+                .collect();
             egui::CollapsingHeader::new(
-                RichText::new(format!("⚠ {warn_count} surfaces with geometry warnings"))
+                RichText::new(format!("⚠ Flagged surfaces ({})  ·  N: next", flagged.len()))
                     .color(Color32::YELLOW),
             )
             .show(ui, |ui| {
-                let names: Vec<(usize, String)> = self
-                    .model
-                    .surfaces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| !s.warnings.is_empty())
-                    .map(|(i, s)| (i, s.name.clone()))
-                    .collect();
-                for (i, name) in names {
+                for (i, name) in flagged {
                     if ui.link(&name).clicked() {
                         self.select(Some(i));
                     }
+                }
+            });
+            ui.separator();
+        }
+
+        if !self.model.warnings.is_empty() {
+            egui::CollapsingHeader::new(
+                RichText::new(format!("Model warnings ({})", self.model.warnings.len()))
+                    .color(Color32::YELLOW),
+            )
+            .show(ui, |ui| {
+                for w in &self.model.warnings {
+                    ui.label(w);
                 }
             });
             ui.separator();
@@ -460,8 +672,11 @@ impl App {
                 row("IDF line", format!("{}", s.line));
             });
 
-        for w in &s.warnings {
-            ui.label(RichText::new(format!("⚠ {w}")).color(Color32::YELLOW));
+        for p in &s.problems {
+            ui.label(
+                RichText::new(format!("⚠ {}: {}", p.kind.label(), p.message))
+                    .color(severity_color(p.severity)),
+            );
         }
 
         ui.horizontal(|ui| {
@@ -482,8 +697,29 @@ impl App {
         egui::CollapsingHeader::new("Vertices (world, m)")
             .default_open(false)
             .show(ui, |ui| {
-                for (i, v) in s.verts.iter().enumerate() {
-                    ui.monospace(format!("{}: ({:.4}, {:.4}, {:.4})", i + 1, v.x, v.y, v.z));
+                for (i, (v, f)) in s.verts.iter().zip(&s.vert_flags).enumerate() {
+                    let mut line = format!("{}: ({:.4}, {:.4}, {:.4})", i + 1, v.x, v.y, v.z);
+                    if f.duplicate {
+                        line.push_str("  · duplicate");
+                    }
+                    if f.collinear {
+                        line.push_str("  · collinear");
+                    } else if f.near_collinear {
+                        line.push_str("  · nearly collinear");
+                    }
+                    if f.plane_dev.abs() > 0.005 {
+                        line.push_str(&format!("  · {:+.3} m off plane", f.plane_dev));
+                    }
+                    let flagged = f.duplicate
+                        || f.collinear
+                        || f.near_collinear
+                        || f.plane_dev.abs() > 0.005;
+                    let text = RichText::new(line).monospace();
+                    ui.label(if flagged {
+                        text.color(Color32::from_rgb(240, 200, 60))
+                    } else {
+                        text
+                    });
                 }
             });
 
@@ -541,23 +777,83 @@ impl App {
         };
         let visibility = self.visibility_dirty.then(|| self.visible.clone());
         self.visibility_dirty = false;
+        let colors = self.colors_dirty.then(|| self.surface_colors());
+        self.colors_dirty = false;
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             ViewCallback {
                 uniforms,
                 overlay: self.overlay(),
                 visibility,
+                colors,
             },
         ));
+
+        self.draw_vertex_dots(ui, rect, aspect);
 
         // Hint text overlay.
         ui.painter().text(
             rect.left_bottom() + egui::vec2(8.0, -8.0),
             egui::Align2::LEFT_BOTTOM,
-            "drag: orbit · shift-drag / right-drag: pan · scroll: zoom · click: select · F: fit",
+            "drag: orbit · shift-drag / right-drag: pan · scroll: zoom · click: select · F: fit · N: next problem",
             egui::FontId::proportional(12.0),
             Color32::from_rgba_unmultiplied(255, 255, 255, 140),
         );
+    }
+
+    /// Numbered vertex dots + winding-direction arrow for the selected surface.
+    /// Colors: white = ok, yellow = collinear, orange = nearly collinear,
+    /// red = duplicate; the first vertex gets a magenta ring.
+    fn draw_vertex_dots(&self, ui: &egui::Ui, rect: egui::Rect, aspect: f32) {
+        let Some(sel) = self.selected else { return };
+        let s = &self.model.surfaces[sel];
+        let vp = self.camera.view_proj(aspect);
+        let to_screen = |v: Vec3| -> Option<egui::Pos2> {
+            let clip = vp * v.extend(1.0);
+            if clip.w <= 0.0 {
+                return None;
+            }
+            let ndc = clip.truncate() / clip.w;
+            if !(0.0..=1.0).contains(&ndc.z) {
+                return None;
+            }
+            Some(egui::pos2(
+                rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
+                rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
+            ))
+        };
+        let painter = ui.painter().with_clip_rect(rect);
+        let magenta = Color32::from_rgb(255, 38, 230);
+
+        if s.verts.len() >= 2 {
+            if let (Some(a), Some(b)) = (to_screen(s.verts[0]), to_screen(s.verts[1])) {
+                painter.arrow(a, (b - a) * 0.45, egui::Stroke::new(2.0, magenta));
+            }
+        }
+        for (i, (v, f)) in s.verts.iter().zip(&s.vert_flags).enumerate() {
+            let Some(p) = to_screen(*v) else { continue };
+            let (fill, r) = if f.duplicate {
+                (Color32::from_rgb(235, 70, 70), 4.5)
+            } else if f.collinear {
+                (Color32::from_rgb(245, 205, 40), 4.5)
+            } else if f.near_collinear {
+                (Color32::from_rgb(240, 150, 60), 4.0)
+            } else {
+                (Color32::WHITE, 3.0)
+            };
+            painter.circle_filled(p, r, fill);
+            painter.circle_stroke(p, r, egui::Stroke::new(1.0, Color32::from_black_alpha(160)));
+            if i == 0 {
+                painter.circle_stroke(p, r + 3.0, egui::Stroke::new(1.5, magenta));
+            }
+            painter.text(
+                p + egui::vec2(6.0, -4.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{}", i + 1),
+                egui::FontId::proportional(11.0),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 220),
+            );
+        }
     }
 
     // --- demo mode ----------------------------------------------------------
@@ -680,7 +976,18 @@ impl App {
                 let d = self.demo.as_mut().unwrap();
                 shoot(d, ctx, "05-window-closeup.png");
             }
-            53.. => {
+            53 => {
+                self.select(None);
+                self.color_mode = ColorMode::Problems;
+                self.colors_dirty = true;
+                self.camera.pitch = 0.5;
+                self.zoom_to_fit();
+            }
+            58 => {
+                let d = self.demo.as_mut().unwrap();
+                shoot(d, ctx, "06-color-problems.png");
+            }
+            61.. => {
                 let d = self.demo.as_mut().unwrap();
                 if d.pending_shots == 0 && !d.closing {
                     d.closing = true;
@@ -705,12 +1012,20 @@ impl eframe::App for App {
             self.run_demo(&ctx);
         }
 
+        // Hotkeys are disabled while a text field (e.g. the regex filter) has focus.
+        let typing = ctx.egui_wants_keyboard_input();
         ctx.input(|i| {
+            if typing {
+                return;
+            }
             if i.key_pressed(egui::Key::F) {
                 self.zoom_to_fit();
             }
             if i.key_pressed(egui::Key::Escape) {
                 self.selected = None;
+            }
+            if i.key_pressed(egui::Key::N) {
+                self.select_next_problem();
             }
         });
 

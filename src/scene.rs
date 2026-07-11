@@ -97,9 +97,13 @@ pub struct SurfaceIndices {
     pub tris: Vec<u32>,
     pub edges: Vec<u32>,
     pub transparent: bool,
+    /// This surface's slice of the shared vertex buffer.
+    pub vert_range: std::ops::Range<u32>,
 }
 
 pub struct SceneRenderer {
+    /// CPU copy of the mesh vertices, kept for re-coloring.
+    cpu_verts: Vec<Vertex>,
     mesh_pipeline: wgpu::RenderPipeline,
     mesh_pipeline_no_depth_write: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
@@ -153,6 +157,7 @@ pub fn build_mesh(model: &Model) -> (Vec<Vertex>, Vec<Vertex>, Vec<SurfaceIndice
             tris,
             edges,
             transparent: s.stype.is_transparent(),
+            vert_range: base..base + n,
         });
     }
     (verts, edge_verts, per_surface)
@@ -305,7 +310,7 @@ impl SceneRenderer {
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene verts"),
             contents: bytemuck::cast_slice(verts),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let edge_vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("edge verts"),
@@ -335,6 +340,7 @@ impl SceneRenderer {
         });
 
         Self {
+            cpu_verts: verts.to_vec(),
             mesh_pipeline,
             mesh_pipeline_no_depth_write,
             edge_pipeline,
@@ -353,6 +359,16 @@ impl SceneRenderer {
             overlay_count: 0,
             per_surface: Vec::from(per_surface),
         }
+    }
+
+    /// Re-color the mesh with one color per surface (edge colors unchanged).
+    pub fn set_colors(&mut self, queue: &wgpu::Queue, colors: &[[f32; 4]]) {
+        for (s, color) in self.per_surface.iter().zip(colors) {
+            for i in s.vert_range.clone() {
+                self.cpu_verts[i as usize].color = *color;
+            }
+        }
+        queue.write_buffer(&self.vertex_buf, 0, bytemuck::cast_slice(&self.cpu_verts));
     }
 
     /// Rebuild index buffers for the given per-surface visibility.
@@ -429,6 +445,8 @@ pub struct ViewCallback {
     pub overlay: Vec<Vertex>,
     /// When Some, per-surface visibility changed and index buffers are rebuilt.
     pub visibility: Option<Vec<bool>>,
+    /// When Some, the mesh is re-colored with one color per surface.
+    pub colors: Option<Vec<[f32; 4]>>,
 }
 
 impl egui_wgpu::CallbackTrait for ViewCallback {
@@ -443,6 +461,9 @@ impl egui_wgpu::CallbackTrait for ViewCallback {
         if let Some(scene) = callback_resources.get_mut::<SceneRenderer>() {
             if let Some(vis) = &self.visibility {
                 scene.set_visibility(queue, vis);
+            }
+            if let Some(colors) = &self.colors {
+                scene.set_colors(queue, colors);
             }
             scene.update(queue, &self.uniforms, &self.overlay);
         }

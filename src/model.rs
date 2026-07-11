@@ -82,6 +82,125 @@ impl SurfaceType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl Severity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        }
+    }
+}
+
+/// Kinds of geometry problems the loader and analysis passes can flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProblemKind {
+    Degenerate,
+    SelfIntersecting,
+    TriangulationFailed,
+    NonPlanar,
+    DuplicateVertex,
+    CollinearVertex,
+    Sliver,
+    UpsideDown,
+    SubSurfaceOffBase,
+    SubSurfaceTooBig,
+    SubSurfaceOverlap,
+    InterzoneMismatch,
+    DuplicateSurface,
+    CoplanarOverlap,
+    ZoneNotClosed,
+    Outlier,
+}
+
+impl ProblemKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProblemKind::Degenerate => "Degenerate",
+            ProblemKind::SelfIntersecting => "Self-intersecting",
+            ProblemKind::TriangulationFailed => "Triangulation failed",
+            ProblemKind::NonPlanar => "Non-planar",
+            ProblemKind::DuplicateVertex => "Duplicate vertices",
+            ProblemKind::CollinearVertex => "Collinear vertices",
+            ProblemKind::Sliver => "Sliver",
+            ProblemKind::UpsideDown => "Type/tilt mismatch",
+            ProblemKind::SubSurfaceOffBase => "Sub-surface off base",
+            ProblemKind::SubSurfaceTooBig => "Sub-surface too big",
+            ProblemKind::SubSurfaceOverlap => "Sub-surfaces overlap",
+            ProblemKind::InterzoneMismatch => "Interzone mismatch",
+            ProblemKind::DuplicateSurface => "Duplicate surface",
+            ProblemKind::CoplanarOverlap => "Coplanar overlap",
+            ProblemKind::ZoneNotClosed => "Zone not closed",
+            ProblemKind::Outlier => "Far from model",
+        }
+    }
+
+    pub fn default_severity(self) -> Severity {
+        match self {
+            ProblemKind::Degenerate
+            | ProblemKind::SelfIntersecting
+            | ProblemKind::TriangulationFailed
+            | ProblemKind::SubSurfaceOffBase
+            | ProblemKind::SubSurfaceTooBig
+            | ProblemKind::InterzoneMismatch => Severity::Error,
+            ProblemKind::NonPlanar
+            | ProblemKind::DuplicateVertex
+            | ProblemKind::CollinearVertex
+            | ProblemKind::UpsideDown
+            | ProblemKind::SubSurfaceOverlap
+            | ProblemKind::DuplicateSurface
+            | ProblemKind::CoplanarOverlap
+            | ProblemKind::Outlier => Severity::Warning,
+            ProblemKind::Sliver | ProblemKind::ZoneNotClosed => Severity::Info,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Problem {
+    pub kind: ProblemKind,
+    pub severity: Severity,
+    pub message: String,
+}
+
+impl Problem {
+    pub fn new(kind: ProblemKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            severity: kind.default_severity(),
+            message: message.into(),
+        }
+    }
+
+    pub fn with_severity(kind: ProblemKind, severity: Severity, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            severity,
+            message: message.into(),
+        }
+    }
+}
+
+/// Per-vertex diagnostics (drawn as colored dots on the selected surface).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VertexFlags {
+    /// Coincides with the next vertex (< 1 mm apart).
+    pub duplicate: bool,
+    /// Lies exactly on the line between its neighbors (redundant).
+    pub collinear: bool,
+    /// Within ~1 degree of collinear with its neighbors.
+    pub near_collinear: bool,
+    /// Signed distance (m) from the surface's mean plane.
+    pub plane_dev: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Surface {
     pub name: String,
@@ -108,8 +227,12 @@ pub struct Surface {
     pub raw: String,
     /// 1-based line number in the source file.
     pub line: usize,
-    /// Geometry problems detected while building (empty = OK).
-    pub warnings: Vec<String>,
+    /// Geometry problems detected while building/analyzing (empty = OK).
+    pub problems: Vec<Problem>,
+    /// Per-vertex diagnostics, same length as `verts`.
+    pub vert_flags: Vec<VertexFlags>,
+    /// Index of the base surface if this is a sub-surface.
+    pub base_surface: Option<usize>,
 }
 
 pub struct Model {
@@ -157,7 +280,13 @@ pub fn build(objects: &[IdfObject]) -> Model {
 
     // --- Zones -------------------------------------------------------------
     let mut zones: HashMap<String, ZoneInfo> = HashMap::new();
+    let mut zone_volumes: HashMap<String, f64> = HashMap::new();
     for o in objects.iter().filter(|o| eq(&o.class, "Zone")) {
+        if let Some(v) = o.field_f64(8) {
+            if v > 0.0 {
+                zone_volumes.insert(o.field(0).to_ascii_uppercase(), v);
+            }
+        }
         zones.insert(
             o.field(0).to_ascii_uppercase(),
             ZoneInfo {
@@ -259,6 +388,7 @@ pub fn build(objects: &[IdfObject]) -> Model {
             ccw,
         );
         s.boundary = format!("(sub-surface of {base_name})");
+        s.base_surface = base_index.get(&base_name.to_ascii_uppercase()).copied();
         offset_along_normal(&mut s, 0.015);
         surfaces.push(s);
     }
@@ -308,6 +438,7 @@ pub fn build(objects: &[IdfObject]) -> Model {
             true, // constructed CCW-from-outside by rectangle_on_surface
         );
         s.boundary = format!("(sub-surface of {base_name})");
+        s.base_surface = Some(bi);
         offset_along_normal(&mut s, 0.015);
         surfaces.push(s);
     }
@@ -340,7 +471,9 @@ pub fn build(objects: &[IdfObject]) -> Model {
         ));
     }
 
-    Model { surfaces, warnings }
+    let mut model = Model { surfaces, warnings };
+    crate::analysis::analyze(&mut model, &zone_volumes);
+    model
 }
 
 fn eq(a: &str, b: &str) -> bool {
@@ -399,7 +532,9 @@ fn make_surface(
     verts: Vec<DVec3>,
     ccw: bool,
 ) -> Surface {
-    let mut warnings_out = Vec::new();
+    let mut problems: Vec<Problem> = Vec::new();
+    let nv = verts.len();
+    const DUP_TOL: f64 = 1e-3; // 1 mm
 
     let mut n = newell(&verts);
     if !ccw {
@@ -407,34 +542,134 @@ fn make_surface(
     }
     let area = n.length() / 2.0;
     if area < 1e-9 {
-        warnings_out.push("degenerate surface (zero area)".to_string());
+        problems.push(Problem::new(
+            ProblemKind::Degenerate,
+            "zero-area surface".to_string(),
+        ));
     }
     let normal = if area > 1e-12 { n.normalize() } else { DVec3::Z };
 
-    // Planarity check: max vertex distance from the mean plane.
+    let mut flags = vec![VertexFlags::default(); nv];
+
+    // Coincident consecutive vertices.
+    let mut dups = 0;
+    for i in 0..nv {
+        if (verts[(i + 1) % nv] - verts[i]).length() < DUP_TOL {
+            flags[i].duplicate = true;
+            dups += 1;
+        }
+    }
+    if dups > 0 {
+        problems.push(Problem::new(
+            ProblemKind::DuplicateVertex,
+            format!("{dups} pair(s) of consecutive vertices less than 1 mm apart"),
+        ));
+    }
+
+    // Collinear / nearly collinear vertices (zero-length edges skipped —
+    // those are already flagged as duplicates).
+    let (mut collinear, mut near) = (0, 0);
+    for i in 0..nv {
+        let e1 = verts[i] - verts[(i + nv - 1) % nv];
+        let e2 = verts[(i + 1) % nv] - verts[i];
+        if e1.length() < DUP_TOL || e2.length() < DUP_TOL {
+            continue;
+        }
+        let sin = e1.cross(e2).length() / (e1.length() * e2.length());
+        if sin < 1e-4 {
+            flags[i].collinear = true;
+            collinear += 1;
+        } else if sin < 0.0175 {
+            flags[i].near_collinear = true;
+            near += 1;
+        }
+    }
+    if collinear > 0 {
+        problems.push(Problem::new(
+            ProblemKind::CollinearVertex,
+            format!("{collinear} redundant vertex(es) exactly on the line between their neighbors"),
+        ));
+    }
+    if near > 0 {
+        problems.push(Problem::with_severity(
+            ProblemKind::CollinearVertex,
+            Severity::Info,
+            format!("{near} vertex(es) within 1° of collinear with their neighbors"),
+        ));
+    }
+
+    // Sliver shapes: very short edges or an extreme aspect ratio.
+    let (mut shortest, mut longest) = (f64::MAX, 0.0f64);
+    for i in 0..nv {
+        let l = (verts[(i + 1) % nv] - verts[i]).length();
+        if l >= DUP_TOL {
+            shortest = shortest.min(l);
+        }
+        longest = longest.max(l);
+    }
+    if nv >= 3 && shortest < 0.01 {
+        problems.push(Problem::new(
+            ProblemKind::Sliver,
+            format!("shortest edge is only {:.0} mm", shortest * 1000.0),
+        ));
+    }
+    if area > 1e-9 && longest * longest / area > 1e4 {
+        problems.push(Problem::new(
+            ProblemKind::Sliver,
+            format!("extremely thin (longest edge² / area ≈ {:.0})", longest * longest / area),
+        ));
+    }
+
+    // Planarity: vertex distance from the mean plane.
     let centroid = verts.iter().copied().sum::<DVec3>() / verts.len().max(1) as f64;
-    let max_dev = verts
-        .iter()
-        .map(|v| ((*v - centroid).dot(normal)).abs())
-        .fold(0.0f64, f64::max);
+    let mut max_dev = 0.0f64;
+    for (i, v) in verts.iter().enumerate() {
+        let d = (*v - centroid).dot(normal);
+        flags[i].plane_dev = d as f32;
+        max_dev = max_dev.max(d.abs());
+    }
     if max_dev > 0.01 {
-        warnings_out.push(format!("non-planar: vertices deviate up to {max_dev:.3} m from plane"));
+        problems.push(Problem::with_severity(
+            ProblemKind::NonPlanar,
+            if max_dev > 0.1 { Severity::Error } else { Severity::Warning },
+            format!("vertices deviate up to {max_dev:.3} m from the mean plane"),
+        ));
     }
 
     // Triangulate in the plane of the polygon.
     let (u, v) = plane_basis(normal);
-    let poly2d: Vec<f64> = verts
+    let pts2d: Vec<(f64, f64)> = verts
         .iter()
-        .flat_map(|p| {
+        .map(|p| {
             let d = *p - centroid;
-            [d.dot(u), d.dot(v)]
+            (d.dot(u), d.dot(v))
         })
         .collect();
+
+    if nv >= 4 && area > 1e-9 {
+        if let Some((i, j)) = crate::analysis::self_intersection(&pts2d) {
+            problems.push(Problem::new(
+                ProblemKind::SelfIntersecting,
+                format!(
+                    "edge {}→{} crosses edge {}→{}",
+                    i + 1,
+                    (i + 1) % nv + 1,
+                    j + 1,
+                    (j + 1) % nv + 1
+                ),
+            ));
+        }
+    }
+
+    let poly2d: Vec<f64> = pts2d.iter().flat_map(|&(x, y)| [x, y]).collect();
     let tris: Vec<u32> = match earcutr::earcut(&poly2d, &[], 2) {
         Ok(t) if !t.is_empty() => t.into_iter().map(|i| i as u32).collect(),
         _ => {
             if verts.len() >= 3 {
-                warnings_out.push("triangulation failed; using fan".to_string());
+                problems.push(Problem::new(
+                    ProblemKind::TriangulationFailed,
+                    "triangulation failed; rendering with a vertex fan".to_string(),
+                ));
                 (1..verts.len() as u32 - 1)
                     .flat_map(|i| [0, i, i + 1])
                     .collect()
@@ -450,6 +685,33 @@ fn make_surface(
         if a < 0.0 { a + 360.0 } else { a }
     };
     let tilt = normal.z.clamp(-1.0, 1.0).acos().to_degrees();
+
+    // Surface type vs. orientation (usually a reversed vertex order).
+    if area >= 1e-9 {
+        let tilt_msg = match stype {
+            SurfaceType::Wall => (!(60.0..=120.0).contains(&tilt))
+                .then(|| format!("wall tilt is {tilt:.0}° (expected ~90°)")),
+            SurfaceType::Floor => (tilt < 150.0).then(|| {
+                if tilt < 30.0 {
+                    format!("floor faces up (tilt {tilt:.0}°); vertex order is likely reversed")
+                } else {
+                    format!("floor tilt is {tilt:.0}° (expected ~180°, facing down)")
+                }
+            }),
+            SurfaceType::Ceiling | SurfaceType::Roof => (tilt > 60.0).then(|| {
+                let what = if stype == SurfaceType::Ceiling { "ceiling" } else { "roof" };
+                if tilt > 150.0 {
+                    format!("{what} faces down (tilt {tilt:.0}°); vertex order is likely reversed")
+                } else {
+                    format!("{what} tilt is {tilt:.0}° (expected < 60°, facing up)")
+                }
+            }),
+            _ => None,
+        };
+        if let Some(msg) = tilt_msg {
+            problems.push(Problem::new(ProblemKind::UpsideDown, msg));
+        }
+    }
 
     Surface {
         name: name.to_string(),
@@ -469,13 +731,15 @@ fn make_surface(
         tilt,
         raw: o.raw.clone(),
         line: o.line,
-        warnings: warnings_out,
+        problems,
+        vert_flags: flags,
+        base_surface: None,
     }
 }
 
 /// Orthonormal basis (u, v) spanning the plane with normal n, with v pointing
 /// as "up" as possible (so u is horizontal for walls).
-fn plane_basis(n: DVec3) -> (DVec3, DVec3) {
+pub(crate) fn plane_basis(n: DVec3) -> (DVec3, DVec3) {
     let up = if n.z.abs() > 0.99 { DVec3::Y } else { DVec3::Z };
     let u = up.cross(n).normalize();
     let v = n.cross(u).normalize();
@@ -554,7 +818,7 @@ BuildingSurface:Detailed,
         assert!((s.tilt - 90.0).abs() < 1e-3);
         assert!((s.area - 30.0).abs() < 1e-6);
         assert_eq!(s.tris.len(), 6);
-        assert!(s.warnings.is_empty());
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
     }
 
     #[test]
@@ -619,7 +883,83 @@ Version, 25.2;
         let s = &m.surfaces[0];
         assert_eq!(s.tris.len(), 4 * 3);
         assert!((s.area - 12.0).abs() < 1e-6);
-        assert!(s.warnings.is_empty());
+        // Faces up but is typed Floor -> exactly the type/tilt mismatch, nothing else.
+        assert_eq!(s.problems.len(), 1, "{:?}", s.problems);
+        assert_eq!(s.problems[0].kind, ProblemKind::UpsideDown);
+    }
+
+    #[test]
+    fn collinear_vertex_flagged() {
+        let src = "\
+GlobalGeometryRules, LowerLeftCorner, Counterclockwise, World;
+BuildingSurface:Detailed,
+  W, Wall, C1, Z1, , Outdoors, , SunExposed, WindExposed, , 5,
+  0, 0, 0,
+  5, 0, 0,
+  10, 0, 0,
+  10, 0, 3,
+  0, 0, 3;
+Version, 25.2;
+";
+        let m = build(&parse(src));
+        let s = &m.surfaces[0];
+        assert!(s.problems.iter().any(|p| p.kind == ProblemKind::CollinearVertex));
+        assert!(s.vert_flags[1].collinear);
+        assert!(!s.vert_flags[0].collinear);
+    }
+
+    #[test]
+    fn duplicate_vertex_flagged() {
+        let src = "\
+GlobalGeometryRules, LowerLeftCorner, Counterclockwise, World;
+BuildingSurface:Detailed,
+  W, Wall, C1, Z1, , Outdoors, , SunExposed, WindExposed, , 5,
+  0, 0, 0,
+  10, 0, 0,
+  10, 0, 0,
+  10, 0, 3,
+  0, 0, 3;
+Version, 25.2;
+";
+        let m = build(&parse(src));
+        let s = &m.surfaces[0];
+        assert!(s.problems.iter().any(|p| p.kind == ProblemKind::DuplicateVertex));
+        assert!(s.vert_flags[1].duplicate);
+    }
+
+    #[test]
+    fn self_intersecting_flagged() {
+        // Bowtie: edge 2->3 crosses edge 4->1.
+        let src = "\
+GlobalGeometryRules, LowerLeftCorner, Counterclockwise, World;
+BuildingSurface:Detailed,
+  W, Wall, C1, Z1, , Outdoors, , SunExposed, WindExposed, , 4,
+  0, 0, 0,
+  4, 0, 0,
+  1, 0, 3,
+  3, 0, 3;
+Version, 25.2;
+";
+        let m = build(&parse(src));
+        let s = &m.surfaces[0];
+        assert!(s.problems.iter().any(|p| p.kind == ProblemKind::SelfIntersecting));
+    }
+
+    #[test]
+    fn sliver_flagged() {
+        let src = "\
+GlobalGeometryRules, LowerLeftCorner, Counterclockwise, World;
+BuildingSurface:Detailed,
+  W, Wall, C1, Z1, , Outdoors, , SunExposed, WindExposed, , 4,
+  0, 0, 0,
+  10, 0, 0,
+  10, 0, 0.005,
+  0, 0, 0.005;
+Version, 25.2;
+";
+        let m = build(&parse(src));
+        let s = &m.surfaces[0];
+        assert!(s.problems.iter().any(|p| p.kind == ProblemKind::Sliver));
     }
 
     #[test]
@@ -634,6 +974,9 @@ BuildingSurface:Detailed,
 Version, 25.2;
 ";
         let m = build(&parse(src));
-        assert!(m.surfaces[0].warnings.iter().any(|w| w.contains("degenerate")));
+        assert!(m.surfaces[0]
+            .problems
+            .iter()
+            .any(|p| p.kind == ProblemKind::Degenerate));
     }
 }

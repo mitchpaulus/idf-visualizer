@@ -3,6 +3,7 @@
 use crate::camera::{ray_triangle, OrbitCamera};
 use crate::model::{Model, ProblemKind, Severity, Surface, SurfaceType};
 use crate::scene::{self, SceneRenderer, Uniforms, Vertex, ViewCallback};
+use crate::svg::{self, SvgOptions};
 use eframe::{egui, egui_wgpu};
 use egui::{Color32, RichText};
 use glam::Vec3;
@@ -80,6 +81,8 @@ fn boundary_color(boundary: &str) -> [f32; 3] {
 pub struct App {
     model: Model,
     file_name: String,
+    /// Path as given on the command line, reused in the copied SVG command.
+    file_path: String,
     camera: OrbitCamera,
     type_visible: std::collections::BTreeMap<SurfaceType, bool>,
     type_counts: std::collections::BTreeMap<SurfaceType, usize>,
@@ -102,6 +105,8 @@ pub struct App {
     scene_min: Vec3,
     scene_max: Vec3,
     last_viewport: egui::Rect,
+    /// egui time of the last "Copy CLI" click, for the transient confirmation.
+    copied_at: Option<f64>,
     demo: Option<Demo>,
 }
 
@@ -113,7 +118,13 @@ struct Demo {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, model: Model, file_name: String, demo_dir: Option<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        model: Model,
+        file_name: String,
+        file_path: String,
+        demo_dir: Option<PathBuf>,
+    ) -> Self {
         let rs = cc
             .wgpu_render_state
             .as_ref()
@@ -184,6 +195,7 @@ impl App {
             visible: vec![true; n],
             model,
             file_name,
+            file_path,
             camera,
             type_visible,
             type_counts,
@@ -202,6 +214,7 @@ impl App {
             scene_min,
             scene_max,
             last_viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
+            copied_at: None,
             demo: demo_dir.map(|dir| Demo {
                 dir,
                 frame: 0,
@@ -449,6 +462,85 @@ impl App {
         self.selected = idx;
     }
 
+    /// The SVG export settings matching what the viewport is currently showing:
+    /// camera angles plus the type/zone/name filters. `problem_only` has no CLI
+    /// equivalent and is reported separately by the UI.
+    fn svg_options(&self) -> SvgOptions {
+        let rotation = self.camera.yaw.to_degrees().rem_euclid(360.0);
+        SvgOptions {
+            rotation: (rotation * 10.0).round() / 10.0,
+            elevation: (self.camera.pitch.to_degrees() * 10.0).round() / 10.0,
+            zone: self
+                .zone_filter
+                .as_ref()
+                // The CLI applies (?i) itself; anchor so one zone name can't
+                // match another that merely contains it.
+                .and_then(|z| regex::Regex::new(&format!("^{}$", regex::escape(z))).ok()),
+            name: self.regex.clone(),
+            hide: SurfaceType::ALL
+                .into_iter()
+                .filter(|t| {
+                    self.type_counts.get(t).copied().unwrap_or(0) > 0
+                        && !self.type_visible.get(t).copied().unwrap_or(true)
+                })
+                .collect(),
+            // The viewport draws both sides of every surface, so match it:
+            // otherwise floors (outward normal down) vanish from the export.
+            cull: false,
+            ..Default::default()
+        }
+    }
+
+    /// `idf-visualizer svg …` for the current view, writing next to the model.
+    fn svg_cli(&self) -> String {
+        let out = PathBuf::from(&self.file_path)
+            .file_stem()
+            .map(|s| format!("{}.svg", s.to_string_lossy()))
+            .unwrap_or_else(|| "model.svg".to_string());
+        svg::cli_command(&self.file_path, &self.svg_options(), Some(&out))
+    }
+
+    fn svg_export_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("SVG export of this view").show(ui, |ui| {
+            let cmd = self.svg_cli();
+            ui.label(
+                RichText::new(&cmd)
+                    .monospace()
+                    .small()
+                    .color(Color32::LIGHT_GRAY),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Copy CLI")
+                    .on_hover_text(
+                        "Copy the idf-visualizer svg command for the current camera \
+                         angle and filters, for use in a build script.",
+                    )
+                    .clicked()
+                {
+                    ui.ctx().copy_text(cmd);
+                    self.copied_at = Some(ui.input(|i| i.time));
+                }
+                if let Some(t) = self.copied_at {
+                    let age = ui.input(|i| i.time) - t;
+                    if age < 2.5 {
+                        ui.label(RichText::new("copied").color(Color32::LIGHT_GREEN).small());
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                    } else {
+                        self.copied_at = None;
+                    }
+                }
+            });
+            if self.problem_only {
+                ui.label(
+                    RichText::new("Note: \"show only flagged surfaces\" has no CLI equivalent.")
+                        .color(Color32::YELLOW)
+                        .small(),
+                );
+            }
+        });
+    }
+
     // --- UI pieces ----------------------------------------------------------
 
     fn left_panel(&mut self, ui: &mut egui::Ui) {
@@ -462,6 +554,7 @@ impl App {
         if ui.button("Zoom to fit  (F)").clicked() {
             self.zoom_to_fit();
         }
+        self.svg_export_ui(ui);
         ui.horizontal(|ui| {
             ui.label("Color by");
             egui::ComboBox::from_id_salt("color_mode")

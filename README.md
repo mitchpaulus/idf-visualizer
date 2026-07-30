@@ -9,7 +9,70 @@ debugging only — no editing. Built with Rust, wgpu, and egui.
 idf-visualizer model.idf          # open the viewer (defaults to in.idf)
 idf-visualizer model.idf --info   # parse, print surface/geometry warnings, exit
 idf-visualizer model.idf --demo DIR   # scripted run that saves feature screenshots
+idf-visualizer svg model.idf -o model.svg   # headless SVG export for reports
+idf-visualizer -h                 # usage (also --help)
 ```
+
+## SVG export
+
+`idf-visualizer svg` renders the model to a standalone, dependency-free SVG —
+no window or GPU needed, so it works over SSH and in CI. The default view is a
+true isometric (45° azimuth, 35.264° above the horizon), orthographic and
+scaled to fit the content exactly, so the figure has no wasted whitespace.
+
+```sh
+idf-visualizer svg model.idf -o iso.svg               # fitted isometric
+idf-visualizer svg model.idf -r 135 -o ne.svg         # rotate the view
+idf-visualizer svg model.idf -r 0 -e 90 -o plan.svg   # plan view from above
+idf-visualizer svg model.idf --hide roof,ceiling --no-cull --legend -o cut.svg
+idf-visualizer svg model.idf --zone 'core' -w 600 | display -   # stdout
+```
+
+| Option | Meaning |
+|---|---|
+| `-h, --help` | Show usage and exit (also `--help`) |
+| `-o, --out FILE` | Output file (default: stdout) |
+| `-r, --rotation DEG` | View azimuth; 0 = from the south, positive swings east (default 45) |
+| `-e, --elevation DEG` | Angle above the horizon (default 35.264, true isometric) |
+| `-w, --width PX` | Output width (default 1000) |
+| `-H, --height PX` | Output height (default: fitted to the content) |
+| `--margin PX` | Padding around the drawing (default 24) |
+| `--stroke-width N` | Edge width in px (default 0.8) |
+| `--zone REGEX` | Only surfaces whose zone matches (case-insensitive) |
+| `--name REGEX` | Only surfaces whose name matches (case-insensitive) |
+| `--hide TYPES` | Comma-separated types to omit, e.g. `roof,ceiling` |
+| `--no-cull` | Also draw surfaces facing away from the viewer |
+| `--flat` | Solid type colors instead of angle-based shading |
+| `--legend` | Surface-type key below the model |
+| `--background CSS` | Canvas fill (default: transparent) |
+
+### Copy CLI from the viewer
+
+Lining up an angle by hand is easier than guessing degrees, so the viewer's
+left panel has an **SVG export of this view** section: it shows the
+`idf-visualizer svg …` command for the current camera angle and filters and
+copies it to the clipboard with **Copy CLI**. Orbit until the model looks
+right, toggle the surface types and zone/name filters you want, copy, and
+paste the line into a build script — the export then reproduces that view
+without the GUI.
+
+The copied command carries the camera rotation and elevation, the hidden
+surface types, the zone and name filters, an `-o <model>.svg` next to the
+model, and `--no-cull` (the viewport draws both sides of every surface, so
+matching it keeps floor plates in the picture). "Show only flagged surfaces"
+has no CLI equivalent and is called out in the panel when it is on.
+
+Faces are painted back to front and shaded by their angle to the viewer, using
+the same type colors as the interactive viewer. Hidden surfaces come out right
+without a z-buffer: the depth sort is followed by Newell's swap pass, so a face
+that genuinely occludes another is painted after it even when a large polygon
+(a floor plate) reaches nearer the eye than the small ones covering it (the
+roof above). Windows and doors are coplanar with their host wall, where no
+depth test can separate them, so they ride along immediately after their base
+surface.
+Back-facing opaque surfaces are culled by default; since an EnergyPlus floor's
+outward normal points down, a roof-off cutaway usually wants `--no-cull` so
+floor plates show.
 
 ## Controls
 
@@ -32,6 +95,8 @@ idf-visualizer model.idf --demo DIR   # scripted run that saves feature screensh
   area (m²/ft²), azimuth, tilt, normal, vertices, and the raw IDF text with
   its source line number.
 - Zoom-to-fit and zoom-to-surface.
+- "Copy CLI": the `idf-visualizer svg` command for the current view and
+  filters, for pasting into a reproducible build script (see below).
 - Geometry diagnostics: degenerate (zero-area) and non-planar surfaces are
   flagged and listed.
 
@@ -46,4 +111,4 @@ with ear clipping.
 
 The IDF parsing and geometry construction live in `src/idf.rs` and
 `src/model.rs` with no GPU dependency, so they are unit-testable and
-reusable from a CLI (`--info`).
+reusable from a CLI (`--info`, `svg`).

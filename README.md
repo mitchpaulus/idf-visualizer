@@ -87,9 +87,10 @@ demand sides are resolved through `AirLoopHVAC:SupplyPath`/`ReturnPath`, air
 distribution units, and `ZoneHVAC:EquipmentConnections` node matching. All of
 it comes straight from the IDF — no `.bnd` file needed.
 
-- Click a component for its nodes, referenced sub-objects (fan and coils of a
-  unitary system, controllers of an OA system, a zone's equipment list), and
-  raw IDF text; hover for a quick node tooltip.
+- Every connection carries a node dot; hovering it pops the node name in a
+  readable callout. Click a component for its nodes, referenced sub-objects
+  (fan and coils of a unitary system, controllers of an OA system, a zone's
+  equipment list), and raw IDF text; hover for a quick node tooltip.
 - Zone boxes have a **Show zone in 3D** button that jumps to the 3D view
   filtered to that zone.
 - Node-connection mismatches within a branch and unreferenced/missing branch

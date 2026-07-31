@@ -1085,13 +1085,30 @@ impl App {
         let line_color = Color32::from_gray(130);
         let stroke = egui::Stroke::new((1.4 * zoom).clamp(0.4, 2.5), line_color);
         let mut hovered: Option<CompPath> = None;
+        let mut node_hover: Option<(egui::Pos2, f32, String)> = None;
         let hover_pos = response.hover_pos();
 
         for l in &layouts {
-            for seg in &l.lines {
+            for (seg, node) in &l.lines {
                 let (a, b) = (ts(seg[0]), ts(seg[1]));
                 painter.line_segment([a, b], stroke);
                 flow_arrow(&painter, a, b, zoom, line_color);
+                // Node marker: a small dot at the segment midpoint. The name
+                // shows in a callout on hover (drawn after everything else so
+                // it sits on top).
+                if !node.is_empty() && (b - a).length() >= 14.0 {
+                    let mid = egui::pos2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+                    let r = (3.4 * zoom).clamp(2.5, 5.0);
+                    painter.circle(
+                        mid,
+                        r,
+                        Color32::from_rgb(40, 45, 53),
+                        egui::Stroke::new(1.3, Color32::from_gray(150)),
+                    );
+                    if hover_pos.is_some_and(|p| p.distance(mid) <= r + 5.0) {
+                        node_hover = Some((mid, r, node.clone()));
+                    }
+                }
             }
             for (r, path, _) in &l.bars {
                 let sr = tr(*r);
@@ -1219,6 +1236,39 @@ impl App {
         }
         if response.clicked() {
             self.loop_comp = hovered;
+        }
+
+        // Node-name callout, drawn on top of everything. Suppressed while a
+        // component tooltip is up so the two never stack.
+        if hovered.is_none() {
+            if let Some((p, r, name)) = &node_hover {
+                painter.circle_stroke(
+                    *p,
+                    r + 2.0,
+                    egui::Stroke::new(1.5, Color32::from_gray(230)),
+                );
+                let galley = painter.layout_no_wrap(
+                    name.clone(),
+                    egui::FontId::monospace(13.0),
+                    Color32::from_gray(235),
+                );
+                let size = galley.size();
+                let mut pos = *p + egui::vec2(12.0, -size.y - 12.0);
+                pos.x = pos
+                    .x
+                    .min(rect.right() - size.x - 8.0)
+                    .max(rect.left() + 8.0);
+                pos.y = pos.y.max(rect.top() + 8.0);
+                let bg = egui::Rect::from_min_size(pos, size).expand(6.0);
+                painter.rect_filled(bg, 5.0, Color32::from_rgba_unmultiplied(18, 21, 26, 235));
+                painter.rect_stroke(
+                    bg,
+                    5.0,
+                    egui::Stroke::new(1.0, Color32::from_gray(95)),
+                    egui::StrokeKind::Outside,
+                );
+                painter.galley(pos, galley, Color32::from_gray(235));
+            }
         }
 
         // --- overlays ---
@@ -1648,7 +1698,7 @@ const BOX_H: f32 = 48.0;
 const GAP_X: f32 = 46.0;
 const GAP_Y: f32 = 26.0;
 const BAR_W: f32 = 10.0;
-const STUB: f32 = 60.0;
+const STUB: f32 = 80.0;
 const SIDE_GAP: f32 = 120.0;
 const CLOSURE_MARGIN: f32 = 50.0;
 
@@ -1656,7 +1706,9 @@ struct SideLayout {
     boxes: Vec<(egui::Rect, CompPath)>,
     /// Splitter/mixer bars: rect, path, name (for the tooltip).
     bars: Vec<(egui::Rect, CompPath, String)>,
-    lines: Vec<[egui::Pos2; 2]>,
+    /// Flow line segments, each tagged with the node name it carries
+    /// (empty when unknown).
+    lines: Vec<([egui::Pos2; 2], String)>,
     /// (anchor, right-aligned?, text, font size at zoom 1)
     labels: Vec<(egui::Pos2, bool, String, f32)>,
     width: f32,
@@ -1699,8 +1751,9 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
                             px: &mut f32,
                             out: &mut SideLayout| {
         for (bi, b) in branches.iter().enumerate() {
-            for ci in 0..b.components.len() {
-                out.lines.push([egui::pos2(*px, cy), egui::pos2(*x, cy)]);
+            for (ci, c) in b.components.iter().enumerate() {
+                out.lines
+                    .push(([egui::pos2(*px, cy), egui::pos2(*x, cy)], c.inlet.clone()));
                 let r = egui::Rect::from_min_size(
                     egui::pos2(*x, cy - BOX_H / 2.0),
                     egui::vec2(BOX_W, BOX_H),
@@ -1725,7 +1778,14 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
     if n_rows > 0 {
         let bar_top = row_cy(0).min(cy) - 12.0;
         let bar_bot = row_cy(n_rows - 1).max(cy) + 12.0;
-        out.lines.push([egui::pos2(px, cy), egui::pos2(x, cy)]);
+        let into_splitter = side
+            .series_in
+            .last()
+            .and_then(|b| b.components.last())
+            .map(|c| c.outlet.clone())
+            .unwrap_or_else(|| side.inlet_node.clone());
+        out.lines
+            .push(([egui::pos2(px, cy), egui::pos2(x, cy)], into_splitter));
         let sp_name = side
             .splitter
             .as_ref()
@@ -1749,8 +1809,9 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
             let ry = row_cy(bi);
             let mut rx = row_x0;
             let mut rpx = bar_right;
-            for ci in 0..b.components.len() {
-                out.lines.push([egui::pos2(rpx, ry), egui::pos2(rx, ry)]);
+            for (ci, c) in b.components.iter().enumerate() {
+                out.lines
+                    .push(([egui::pos2(rpx, ry), egui::pos2(rx, ry)], c.inlet.clone()));
                 let r = egui::Rect::from_min_size(
                     egui::pos2(rx, ry - BOX_H / 2.0),
                     egui::vec2(BOX_W, BOX_H),
@@ -1772,8 +1833,15 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
         }
         let mx_x = max_right + GAP_X;
         for (bi, &re) in row_end.iter().enumerate() {
-            out.lines
-                .push([egui::pos2(re, row_cy(bi)), egui::pos2(mx_x, row_cy(bi))]);
+            let node = side.parallel[bi]
+                .components
+                .last()
+                .map(|c| c.outlet.clone())
+                .unwrap_or_default();
+            out.lines.push((
+                [egui::pos2(re, row_cy(bi)), egui::pos2(mx_x, row_cy(bi))],
+                node,
+            ));
         }
         let mx_name = side
             .mixer
@@ -1800,8 +1868,10 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
     place_series(&side.series_out, Seg::SeriesOut, &mut x, &mut px, &mut out);
 
     out.width = px + STUB;
-    out.lines
-        .push([egui::pos2(px, cy), egui::pos2(out.width, cy)]);
+    out.lines.push((
+        [egui::pos2(px, cy), egui::pos2(out.width, cy)],
+        side.outlet_node.clone(),
+    ));
     out.outlet = egui::pos2(out.width, cy);
 
     let mut title = side.label.clone();
@@ -1809,7 +1879,7 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
         title.push_str(&format!("  ·  {n_rows} parallel paths"));
     }
     out.labels
-        .push((egui::pos2(0.0, y_top - 12.0), false, title, 13.0));
+        .push((egui::pos2(0.0, y_top - 34.0), false, title, 13.0));
     out
 }
 
@@ -1828,7 +1898,7 @@ fn mirror_layout(l: &mut SideLayout, w: f32) {
     for (r, _, _) in &mut l.bars {
         flip_rect(r);
     }
-    for seg in &mut l.lines {
+    for (seg, _) in &mut l.lines {
         seg[0].x = w - seg[0].x;
         seg[1].x = w - seg[1].x;
     }
@@ -1840,7 +1910,8 @@ fn mirror_layout(l: &mut SideLayout, w: f32) {
     l.outlet.x = w - l.outlet.x;
 }
 
-/// Arrowhead at the midpoint of a flow line (screen coordinates).
+/// Arrowhead on a flow line, placed off-center so it doesn't collide with the
+/// node dot at the midpoint (screen coordinates).
 fn flow_arrow(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, zoom: f32, color: Color32) {
     let v = b - a;
     let len = v.length();
@@ -1850,8 +1921,8 @@ fn flow_arrow(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, zoom: f32, 
     let d = v / len;
     let n = egui::vec2(-d.y, d.x);
     let s = (5.0 * zoom).clamp(1.5, 7.0);
-    let tip = a + v * 0.5 + d * s;
-    let base = a + v * 0.5 - d * s;
+    let tip = a + v * 0.28 + d * s;
+    let base = a + v * 0.28 - d * s;
     let stroke = egui::Stroke::new((1.4 * zoom).clamp(0.4, 2.5), color);
     painter.line_segment([tip, base + n * s], stroke);
     painter.line_segment([tip, base - n * s], stroke);
@@ -1865,6 +1936,7 @@ fn trunc(s: &str, max: usize) -> String {
         format!("{cut}…")
     }
 }
+
 
 fn class_color(class: &str) -> Color32 {
     let c = class.to_ascii_lowercase();

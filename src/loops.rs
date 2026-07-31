@@ -75,6 +75,10 @@ pub struct Side {
     pub series_out: Vec<BranchView>,
     pub splitter: Option<Component>,
     pub mixer: Option<Component>,
+    /// Air streams that leave the main flow path (an OA system's relief /
+    /// exhaust stream), drawn as their own runs below the main line. The
+    /// branch name labels the run.
+    pub aux: Vec<BranchView>,
 }
 
 impl Side {
@@ -257,6 +261,13 @@ fn spec_defs(class: &str) -> &'static [(usize, &'static str, Unit)] {
         "districtheating" | "districtheating:water" | "districtheating:steam" => {
             &[(3, "Capacity", KBtuH)]
         }
+        "coil:heating:electric" => &[(3, "Capacity", KBtuH)],
+        "coil:heating:fuel" => &[(4, "Capacity", KBtuH)],
+        "heatexchanger:airtoair:sensibleandlatent" => &[
+            (2, "Flow", Cfm),
+            (3, "Sens eff", Pct),
+            (4, "Lat eff", Pct),
+        ],
         "waterheater:mixed" => &[(1, "Tank", Gal), (6, "Heater", KBtuH)],
         "fan:constantvolume" | "fan:onoff" => &[
             (4, "Flow", Cfm),
@@ -478,13 +489,180 @@ fn expand_unitary(idx: &Index, unitary: &Component, obj: &IdfObject) -> Vec<Comp
         .collect()
 }
 
+/// Primary-air inlet/outlet node field indices for equipment that can appear
+/// in an AirLoopHVAC:OutdoorAirSystem:EquipmentList, per the 24.2 IDD. For the
+/// air-to-air heat exchangers these are the supply (outdoor-air) side; the
+/// exhaust side of a SensibleAndLatent unit is fields 9/10.
+fn air_nodes(class: &str) -> Option<(usize, usize)> {
+    match class.to_ascii_lowercase().as_str() {
+        "fan:systemmodel" => Some((2, 3)),
+        "fan:constantvolume" | "fan:onoff" => Some((7, 8)),
+        "fan:variablevolume" => Some((15, 16)),
+        "coil:heating:electric" => Some((4, 5)),
+        "coil:heating:fuel" => Some((5, 6)),
+        "coil:heating:water" => Some((6, 7)),
+        "coil:cooling:water" => Some((11, 12)),
+        "coilsystem:cooling:dx" => Some((2, 3)),
+        "heatexchanger:airtoair:sensibleandlatent" => Some((7, 8)),
+        "heatexchanger:airtoair:flatplate" => Some((11, 12)),
+        "humidifier:steam:electric" => Some((6, 7)),
+        "airloophvac:unitarysystem" => Some((5, 6)),
+        _ => None,
+    }
+}
+
+/// A node-field lookup (`air_nodes` or `exhaust_nodes`).
+type NodeFields = fn(&str) -> Option<(usize, usize)>;
+
+/// Exhaust/secondary-side inlet/outlet node field indices for heat exchangers
+/// that sit across both streams of an OA system.
+fn exhaust_nodes(class: &str) -> Option<(usize, usize)> {
+    match class.to_ascii_lowercase().as_str() {
+        "heatexchanger:airtoair:sensibleandlatent" => Some((9, 10)),
+        "heatexchanger:airtoair:flatplate" => Some((13, 14)),
+        _ => None,
+    }
+}
+
+/// Expand an AirLoopHVAC:OutdoorAirSystem into its equipment. Unlike the
+/// unitary system the interior nodes are all named in the IDF, so each box
+/// carries its real inlet/outlet.
+///
+/// The first returned list is the outdoor-air intake path in flow order:
+/// the intake chain (traced upstream from the mixer's OA inlet node), then
+/// unplaceable equipment in list order, then the OutdoorAir:Mixer, whose
+/// return-air inlet and mixed-air outlet are the branch connections. The OA
+/// controllers are surfaced on the mixer box.
+///
+/// The second list is the relief/exhaust stream, traced downstream from the
+/// mixer's relief node. A heat exchanger sits across both streams, so it
+/// appears again here with its exhaust-side nodes.
+fn expand_oa_system(
+    idx: &Index,
+    oa: &Component,
+    obj: &IdfObject,
+) -> (Vec<Component>, Vec<Component>) {
+    let Some(list) = idx.find("AirLoopHVAC:OutdoorAirSystem:EquipmentList", obj.field(2)) else {
+        return (vec![oa.clone()], Vec::new());
+    };
+    let mut items: Vec<(String, String)> = Vec::new();
+    let mut i = 1;
+    while i + 1 < list.fields.len() {
+        let (c, n) = (list.field(i), list.field(i + 1));
+        if !c.is_empty() && !n.is_empty() {
+            items.push((c.to_string(), n.to_string()));
+        }
+        i += 2;
+    }
+    let mixer = items
+        .iter()
+        .position(|(c, _)| eq(c, "OutdoorAir:Mixer"))
+        .map(|p| items.remove(p));
+    let mixer_obj = mixer.as_ref().and_then(|(c, n)| idx.find(c, n));
+
+    let nodes = |class: &str, name: &str, which: NodeFields| {
+        match (which(class), idx.find(class, name)) {
+            (Some((i, o)), Some(eq_obj)) => {
+                (eq_obj.field(i).to_string(), eq_obj.field(o).to_string())
+            }
+            _ => (String::new(), String::new()),
+        }
+    };
+    let mut used = vec![false; items.len()];
+
+    // Intake chain: walk upstream from the mixer's outdoor air inlet.
+    let mut intake: Vec<usize> = Vec::new();
+    if let Some(mx) = mixer_obj {
+        let mut node = mx.field(2).to_string();
+        while !node.is_empty() {
+            let Some(p) = (0..items.len()).find(|&p| {
+                !used[p] && eq(&nodes(&items[p].0, &items[p].1, air_nodes).1, &node)
+            }) else {
+                break;
+            };
+            used[p] = true;
+            node = nodes(&items[p].0, &items[p].1, air_nodes).0;
+            intake.insert(0, p);
+        }
+    }
+
+    // Relief stream: walk downstream from the mixer's relief node. A heat
+    // exchanger already placed on the intake matches through its exhaust-side
+    // nodes; anything else (an exhaust fan) through its ordinary air nodes.
+    let mut relief: Vec<Component> = Vec::new();
+    if let Some(mx) = mixer_obj {
+        let mut node = mx.field(3).to_string();
+        let mut in_relief = vec![false; items.len()];
+        while !node.is_empty() {
+            let hx = (0..items.len()).find(|&p| {
+                !in_relief[p] && eq(&nodes(&items[p].0, &items[p].1, exhaust_nodes).0, &node)
+            });
+            let plain = || {
+                (0..items.len()).find(|&p| {
+                    !in_relief[p]
+                        && !used[p]
+                        && eq(&nodes(&items[p].0, &items[p].1, air_nodes).0, &node)
+                })
+            };
+            let (p, which): (usize, NodeFields) = match hx {
+                Some(p) => (p, exhaust_nodes),
+                None => match plain() {
+                    Some(p) => {
+                        used[p] = true;
+                        (p, air_nodes)
+                    }
+                    None => break,
+                },
+            };
+            in_relief[p] = true;
+            let (inlet, outlet) = nodes(&items[p].0, &items[p].1, which);
+            node = outlet.clone();
+            relief.push(make_component(idx, &items[p].0, &items[p].1, &inlet, &outlet));
+        }
+    }
+
+    let mut comps: Vec<Component> = intake
+        .into_iter()
+        .chain((0..items.len()).filter(|&p| !used[p]))
+        .map(|p| {
+            let (c, n) = &items[p];
+            let (inlet, outlet) = nodes(c, n, air_nodes);
+            make_component(idx, c, n, &inlet, &outlet)
+        })
+        .collect();
+    if let Some((mc, mn)) = &mixer {
+        let (inlet, outlet) = match mixer_obj {
+            Some(mx) => (mx.field(4).to_string(), mx.field(1).to_string()),
+            None => (String::new(), String::new()),
+        };
+        let mut c = make_component(idx, mc, mn, &inlet, &outlet);
+        if let Some(cl) = idx.find("AirLoopHVAC:ControllerList", obj.field(1)) {
+            collect_children(idx, cl, &mut c.children);
+        }
+        comps.push(c);
+    }
+    if comps.is_empty() {
+        return (vec![oa.clone()], Vec::new());
+    }
+    for c in comps.iter_mut().chain(&mut relief) {
+        c.group = Some(oa.name.clone());
+        c.children.push(ChildRef {
+            class: oa.class.clone(),
+            name: oa.name.clone(),
+            raw: oa.raw.clone(),
+            line: oa.line,
+        });
+    }
+    (comps, relief)
+}
+
 /// Does this branch field start the component quads? Component object types
 /// always contain ':' (Pump:VariableSpeed, Coil:Cooling:Water, ...).
 fn looks_like_component_type(s: &str) -> bool {
     s.contains(':') || eq(s, "Duct")
 }
 
-fn branch_components(idx: &Index, branch: &IdfObject) -> Vec<Component> {
+fn branch_components(idx: &Index, branch: &IdfObject, aux: &mut Vec<BranchView>) -> Vec<Component> {
     let f = &branch.fields;
     // Skip leading non-component fields: pressure drop curve name, and in
     // older IDFs a maximum flow rate.
@@ -504,6 +682,16 @@ fn branch_components(idx: &Index, branch: &IdfObject) -> Vec<Component> {
         if eq(&c.class, "AirLoopHVAC:UnitarySystem") && c.found {
             let obj = idx.find(&c.class, &c.name).expect("found implies present");
             comps.extend(expand_unitary(idx, &c, obj));
+        } else if eq(&c.class, "AirLoopHVAC:OutdoorAirSystem") && c.found {
+            let obj = idx.find(&c.class, &c.name).expect("found implies present");
+            let (main, relief) = expand_oa_system(idx, &c, obj);
+            if !relief.is_empty() {
+                aux.push(BranchView {
+                    name: format!("{} relief", c.name),
+                    components: relief,
+                });
+            }
+            comps.extend(main);
         } else {
             comps.push(c);
         }
@@ -519,7 +707,11 @@ fn branch_components(idx: &Index, branch: &IdfObject) -> Vec<Component> {
 fn check_series(loop_name: &str, branch: &BranchView, warnings: &mut Vec<String>) {
     for w in branch.components.windows(2) {
         let (a, b) = (&w[0], &w[1]);
-        if !a.outlet.is_empty() && !b.inlet.is_empty() && !eq(&a.outlet, &b.inlet) {
+        // Boxes expanded from the same compound parent are not necessarily one
+        // series path (an OA system interleaves its intake and relief streams),
+        // so continuity only applies across ordinary connections.
+        let same_group = a.group.is_some() && a.group == b.group;
+        if !same_group && !a.outlet.is_empty() && !b.inlet.is_empty() && !eq(&a.outlet, &b.inlet) {
             warnings.push(format!(
                 "{loop_name}, branch \"{}\": outlet of \"{}\" ({}) does not match inlet of \"{}\" ({})",
                 branch.name, a.name, a.outlet, b.name, b.inlet
@@ -566,7 +758,7 @@ fn build_side(
                 match idx.find("Branch", name) {
                     Some(br) => branches.push(BranchView {
                         name: name.clone(),
-                        components: branch_components(idx, br),
+                        components: branch_components(idx, br, &mut side.aux),
                     }),
                     None => warnings.push(format!(
                         "{loop_name} ({label}): Branch \"{name}\" not found"
@@ -1085,5 +1277,136 @@ AirTerminal:SingleDuct:ConstantVolume:NoReheat,
         );
         assert_eq!(row.components[1].class, "Zone");
         assert_eq!(row.components[1].outlet, "Zone 1 Return");
+    }
+
+    // A 100%-OA unit with a preheat coil and energy wheel on the intake, an
+    // exhaust fan on the relief side, and the supply fan on the main branch.
+    // The equipment list is deliberately out of flow order (wheel before
+    // preheat) to exercise the node-based ordering.
+    const OA: &str = "\
+AirLoopHVAC,
+  DOAS, , , 2.792, DOAS Branches, ,
+  DOAS Air Loop Inlet, DOAS Return Outlet, DOAS Supply Path Inlet, DOAS Unit Outlet;
+BranchList, DOAS Branches, DOAS Main Branch;
+Branch, DOAS Main Branch, ,
+  AirLoopHVAC:OutdoorAirSystem, DOAS OA System, DOAS Air Loop Inlet, DOAS Mixed Air Outlet,
+  Fan:SystemModel, DOAS Supply Fan, DOAS Mixed Air Outlet, DOAS Unit Outlet;
+AirLoopHVAC:OutdoorAirSystem, DOAS OA System, DOAS OA Controllers, DOAS OA Equipment;
+AirLoopHVAC:ControllerList, DOAS OA Controllers, Controller:OutdoorAir, DOAS OA Controller;
+Controller:OutdoorAir, DOAS OA Controller, DOAS Relief Air Outlet, DOAS Air Loop Inlet,
+  DOAS Mixed Air Outlet, DOAS Outdoor Air Inlet, 2.792, 2.792;
+AirLoopHVAC:OutdoorAirSystem:EquipmentList, DOAS OA Equipment,
+  HeatExchanger:AirToAir:SensibleAndLatent, DOAS Energy Wheel,
+  Coil:Heating:Electric, DOAS Preheat Coil,
+  OutdoorAir:Mixer, DOAS OA Mixer,
+  Fan:SystemModel, DOAS Exhaust Fan;
+OutdoorAir:Mixer, DOAS OA Mixer,
+  DOAS Mixed Air Outlet, DOAS HX Supply Outlet, DOAS Relief Air Outlet, DOAS Air Loop Inlet;
+Coil:Heating:Electric, DOAS Preheat Coil, , 1.0, 17973,
+  DOAS Outdoor Air Inlet, DOAS Preheat Outlet, DOAS Preheat Outlet;
+HeatExchanger:AirToAir:SensibleAndLatent, DOAS Energy Wheel, , 2.792,
+  0.754, 0.717, 0.749, 0.711,
+  DOAS Preheat Outlet, DOAS HX Supply Outlet, DOAS Relief Air Outlet, DOAS HX Exhaust Outlet;
+Fan:SystemModel, DOAS Exhaust Fan, , DOAS HX Exhaust Outlet, DOAS Exhaust Fan Outlet, 2.029;
+Fan:SystemModel, DOAS Supply Fan, , DOAS Mixed Air Outlet, DOAS Unit Outlet, 2.792;
+
+AirLoopHVAC:SupplyPath, DOAS Supply Path, DOAS Supply Path Inlet,
+  AirLoopHVAC:ZoneSplitter, DOAS Splitter;
+AirLoopHVAC:ZoneSplitter, DOAS Splitter, DOAS Supply Path Inlet, Zone 1 Supply Inlet;
+AirLoopHVAC:ReturnPath, DOAS Return Path, DOAS Return Outlet,
+  AirLoopHVAC:ZoneMixer, DOAS Return Mixer;
+AirLoopHVAC:ZoneMixer, DOAS Return Mixer, DOAS Return Outlet, Zone 1 Return;
+ZoneHVAC:EquipmentConnections,
+  Zone 1, Zone 1 Equipment, Zone 1 Supply Inlet, , Zone 1 Air Node, Zone 1 Return;
+ZoneHVAC:EquipmentList, Zone 1 Equipment, SequentialLoad;
+";
+
+    #[test]
+    fn oa_system_expands_into_equipment() {
+        let loops = build(&idf::parse(OA));
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+
+        let supply = &l.sides[0];
+        assert_eq!(supply.series_in.len(), 1);
+        let comps = &supply.series_in[0].components;
+        let classes: Vec<&str> = comps.iter().map(|c| c.class.as_str()).collect();
+        // Intake chain in flow order despite the scrambled equipment list,
+        // then the mixer, then the branch's own fan. The relief-side exhaust
+        // fan is NOT on the supply line.
+        assert_eq!(
+            classes,
+            vec![
+                "Coil:Heating:Electric",
+                "HeatExchanger:AirToAir:SensibleAndLatent",
+                "OutdoorAir:Mixer",
+                "Fan:SystemModel",
+            ]
+        );
+
+        // Real nodes from the IDF, unlike the unitary's unnamed interiors.
+        let preheat = &comps[0];
+        assert_eq!(preheat.inlet, "DOAS Outdoor Air Inlet");
+        assert_eq!(preheat.outlet, "DOAS Preheat Outlet");
+        assert_eq!(preheat.group.as_deref(), Some("DOAS OA System"));
+        assert_eq!(preheat.specs, vec![("Capacity", "61.3 kBtu/h".to_string())]);
+        assert!(preheat.children.iter().any(|c| c.name == "DOAS OA System"));
+
+        let wheel = &comps[1];
+        assert_eq!(
+            wheel.specs,
+            vec![
+                ("Flow", "5,916 CFM".to_string()),
+                ("Sens eff", "75.4%".to_string()),
+                ("Lat eff", "71.7%".to_string()),
+            ]
+        );
+
+        // The mixer carries the branch connections (return air in, mixed air
+        // out) and surfaces the OA controller.
+        let mixer = &comps[2];
+        assert_eq!(mixer.inlet, "DOAS Air Loop Inlet");
+        assert_eq!(mixer.outlet, "DOAS Mixed Air Outlet");
+        assert_eq!(mixer.group.as_deref(), Some("DOAS OA System"));
+        assert!(
+            mixer
+                .children
+                .iter()
+                .any(|c| eq(&c.class, "Controller:OutdoorAir"))
+        );
+
+        // The supply fan is a plain branch component outside the group.
+        assert_eq!(comps[3].group, None);
+
+        // The relief stream is its own run: mixer relief node → heat
+        // exchanger exhaust side (its other two nodes) → exhaust fan.
+        assert_eq!(supply.aux.len(), 1);
+        let relief = &supply.aux[0];
+        assert_eq!(relief.name, "DOAS OA System relief");
+        let rc: Vec<(&str, &str, &str)> = relief
+            .components
+            .iter()
+            .map(|c| (c.name.as_str(), c.inlet.as_str(), c.outlet.as_str()))
+            .collect();
+        assert_eq!(
+            rc,
+            vec![
+                (
+                    "DOAS Energy Wheel",
+                    "DOAS Relief Air Outlet",
+                    "DOAS HX Exhaust Outlet"
+                ),
+                (
+                    "DOAS Exhaust Fan",
+                    "DOAS HX Exhaust Outlet",
+                    "DOAS Exhaust Fan Outlet"
+                ),
+            ]
+        );
+        assert_eq!(
+            relief.components[0].group.as_deref(),
+            Some("DOAS OA System")
+        );
     }
 }

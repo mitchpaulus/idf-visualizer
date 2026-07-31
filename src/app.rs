@@ -49,6 +49,8 @@ enum Seg {
     SeriesIn,
     Parallel,
     SeriesOut,
+    /// Secondary stream off the main path (OA system relief/exhaust).
+    Aux,
     Splitter,
     Mixer,
 }
@@ -77,6 +79,7 @@ fn branch_in(hl: &HvacLoop, p: CompPath) -> Option<&BranchView> {
         Seg::SeriesIn => &side.series_in,
         Seg::Parallel => &side.parallel,
         Seg::SeriesOut => &side.series_out,
+        Seg::Aux => &side.aux,
         _ => return None,
     };
     list.get(p.branch)
@@ -821,6 +824,7 @@ impl App {
                     .iter()
                     .chain(&s.parallel)
                     .chain(&s.series_out)
+                    .chain(&s.aux)
                     .map(|b| b.components.len())
                     .sum();
                 ui.label(format!(
@@ -1747,6 +1751,9 @@ const SPEC_CHARS: usize = 34;
 const SPEC_MAX_ROWS: usize = 3;
 const GAP_X: f32 = 46.0;
 const GAP_Y: f32 = 30.0;
+/// Vertical clearance above a secondary (relief/exhaust) run, leaving room
+/// for its label.
+const AUX_GAP: f32 = 42.0;
 const BAR_W: f32 = 10.0;
 const STUB: f32 = 80.0;
 const SIDE_GAP: f32 = 120.0;
@@ -1956,6 +1963,53 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
     ));
     out.outlet = egui::pos2(out.width, cy);
 
+    // Secondary streams (an OA system's relief/exhaust): each is its own
+    // labeled run below the main line, open-ended at both stubs since the air
+    // leaves the system.
+    let mut ay = y_top + height;
+    for (bi, b) in side.aux.iter().enumerate() {
+        let run_h = b.components.iter().map(box_h).fold(BOX_H, f32::max);
+        ay += AUX_GAP + run_h / 2.0;
+        let x0 = STUB;
+        let mut rx = x0;
+        let mut rpx = x0 - 40.0;
+        for (ci, c) in b.components.iter().enumerate() {
+            out.lines
+                .push(([egui::pos2(rpx, ay), egui::pos2(rx, ay)], c.inlet.clone()));
+            let r = egui::Rect::from_center_size(
+                egui::pos2(rx + BOX_W / 2.0, ay),
+                egui::vec2(BOX_W, box_h(c)),
+            );
+            out.boxes.push((
+                r,
+                CompPath {
+                    side: side_idx,
+                    seg: Seg::Aux,
+                    branch: bi,
+                    comp: ci,
+                },
+            ));
+            rpx = rx + BOX_W;
+            rx = rpx + GAP_X;
+        }
+        let node = b
+            .components
+            .last()
+            .map(|c| c.outlet.clone())
+            .unwrap_or_default();
+        out.lines
+            .push(([egui::pos2(rpx, ay), egui::pos2(rpx + 40.0, ay)], node));
+        out.labels.push((
+            egui::pos2(x0 - 40.0, ay - run_h / 2.0 - 5.0),
+            false,
+            b.name.clone(),
+            10.0,
+        ));
+        out.width = out.width.max(rpx + 40.0);
+        ay += run_h / 2.0;
+    }
+    out.height = ay - y_top;
+
     // Bracket consecutive boxes expanded from the same compound parent
     // (same branch, same group name).
     let comp_of = |p: &CompPath| -> Option<&LoopPart> {
@@ -2106,7 +2160,7 @@ fn class_color(class: &str) -> Color32 {
         (220, 90, 90)
     } else if c.contains("unitary") || c.contains("furnace") {
         (225, 170, 90)
-    } else if c.contains("outdoorairsystem") {
+    } else if c.contains("outdoorairsystem") || c == "outdoorair:mixer" {
         (120, 180, 235)
     } else if c.contains("airterminal") || c.contains("airdistribution") {
         (170, 190, 100)
@@ -2183,10 +2237,39 @@ mod tests {
             series_out: vec![branch("outb", &[("Pipe:Adiabatic", "Out pipe")])],
             splitter: Some(comp("Connector:Splitter", "S")),
             mixer: Some(comp("Connector:Mixer", "M")),
+            aux: vec![branch(
+                "relief",
+                &[
+                    ("HeatExchanger:AirToAir:SensibleAndLatent", "HX2"),
+                    ("Fan:SystemModel", "EF1"),
+                ],
+            )],
         };
         let l = layout_side(&side, 0, 0.0);
-        assert_eq!(l.boxes.len(), 6);
+        assert_eq!(l.boxes.len(), 8);
         assert_eq!(l.bars.len(), 2);
+        // The aux (relief) run sits below everything on the main line and is
+        // included in the side height.
+        let aux_top = l
+            .boxes
+            .iter()
+            .filter(|(_, p)| p.seg == Seg::Aux)
+            .map(|(r, _)| r.min.y)
+            .fold(f32::INFINITY, f32::min);
+        let main_bot = l
+            .boxes
+            .iter()
+            .filter(|(_, p)| p.seg != Seg::Aux)
+            .map(|(r, _)| r.max.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(aux_top > main_bot);
+        let aux_bot = l
+            .boxes
+            .iter()
+            .filter(|(_, p)| p.seg == Seg::Aux)
+            .map(|(r, _)| r.max.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(l.height >= aux_bot);
         for (i, (a, _)) in l.boxes.iter().enumerate() {
             for (b, _) in &l.boxes[i + 1..] {
                 assert!(!a.intersects(*b), "boxes overlap: {a:?} vs {b:?}");

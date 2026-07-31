@@ -51,6 +51,9 @@ pub struct Component {
     pub children: Vec<ChildRef>,
     /// Key sizing values in IP units, e.g. ("Capacity", "500 tons").
     pub specs: Vec<(&'static str, String)>,
+    /// Name of the compound parent this box was expanded out of
+    /// (e.g. an AirLoopHVAC:UnitarySystem); drawn as a bracket around the run.
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +216,14 @@ enum Unit {
     InH2O,
     /// m3 → gal
     Gal,
+    /// fraction → %
+    Pct,
+    /// W → kW
+    Kw,
+    /// W → tons and kBtu/h together
+    TonsBtu,
+    /// dimensionless (COP, ...)
+    Plain,
 }
 
 /// Sizing fields worth surfacing, per class: (field index, label, unit).
@@ -237,16 +248,35 @@ fn spec_defs(class: &str) -> &'static [(usize, &'static str, Unit)] {
         "coolingtower:singlespeed" | "coolingtower:twospeed" => &[(3, "Water flow", Gpm)],
         "coolingtower:variablespeed" => &[(8, "Water flow", Gpm)],
         "coil:cooling:water" => &[(2, "Water flow", Gpm)],
+        "coil:cooling:dx:singlespeed" | "coil:cooling:dx:twospeed" => {
+            &[(2, "Capacity", TonsBtu), (4, "COP", Plain)]
+        }
+        "coil:cooling:dx:variablespeed" => &[(5, "Capacity", TonsBtu)],
         "coil:heating:water" => &[(3, "Water flow", Gpm), (9, "Capacity", KBtuH)],
         "districtcooling" => &[(3, "Capacity", Tons)],
         "districtheating" | "districtheating:water" | "districtheating:steam" => {
             &[(3, "Capacity", KBtuH)]
         }
         "waterheater:mixed" => &[(1, "Tank", Gal), (6, "Heater", KBtuH)],
-        "fan:variablevolume" | "fan:constantvolume" | "fan:onoff" => {
-            &[(4, "Flow", Cfm), (3, "ΔP", InH2O)]
-        }
-        "fan:systemmodel" => &[(4, "Flow", Cfm), (7, "ΔP", InH2O)],
+        "fan:constantvolume" | "fan:onoff" => &[
+            (4, "Flow", Cfm),
+            (3, "ΔP", InH2O),
+            (5, "Motor eff", Pct),
+            (2, "Fan eff", Pct),
+        ],
+        "fan:variablevolume" => &[
+            (4, "Flow", Cfm),
+            (3, "ΔP", InH2O),
+            (8, "Motor eff", Pct),
+            (2, "Fan eff", Pct),
+        ],
+        "fan:systemmodel" => &[
+            (4, "Flow", Cfm),
+            (7, "ΔP", InH2O),
+            (10, "Power", Kw),
+            (8, "Motor eff", Pct),
+            (14, "Fan eff", Pct),
+        ],
         _ => &[],
     }
 }
@@ -297,8 +327,38 @@ fn fmt_spec(raw: &str, unit: Unit) -> Option<String> {
         Unit::Cfm => (v * 2118.88, "CFM"),
         Unit::InH2O => (v / 249.089, "in. w.c."),
         Unit::Gal => (v * 264.172, "gal"),
+        Unit::Pct => (v * 100.0, "%"),
+        Unit::Kw => return Some(fmt_power(v)),
+        Unit::TonsBtu => {
+            return Some(format!(
+                "{} tons ({} kBtu/h)",
+                fmt_num(v / 3516.85),
+                fmt_num(v / 293.071)
+            ));
+        }
+        Unit::Plain => return Some(fmt_num(v)),
     };
+    if matches!(unit, Unit::Pct) {
+        return Some(format!("{}{}", fmt_num(v), suffix));
+    }
     Some(format!("{} {}", fmt_num(v), suffix))
+}
+
+/// Power in both kW and hp, from watts.
+fn fmt_power(w: f64) -> String {
+    format!("{} kW ({} hp)", fmt_num(w / 1000.0), fmt_num(w / 745.7))
+}
+
+/// Simple fans (OnOff/ConstantVolume/VariableVolume) have no power field;
+/// EnergyPlus computes design power as flow · ΔP / total efficiency.
+fn fan_power_spec(obj: &IdfObject) -> Option<String> {
+    let flow = obj.field_f64(4)?;
+    let dp = obj.field_f64(3)?;
+    let eff = obj.field_f64(2)?;
+    if eff <= 0.0 {
+        return None;
+    }
+    Some(fmt_power(flow * dp / eff))
 }
 
 fn make_component(idx: &Index, class: &str, name: &str, inlet: &str, outlet: &str) -> Component {
@@ -319,8 +379,103 @@ fn make_component(idx: &Index, class: &str, name: &str, inlet: &str, outlet: &st
                 c.specs.push((label, v));
             }
         }
+        let lc = obj.class.to_ascii_lowercase();
+        if matches!(
+            lc.as_str(),
+            "fan:onoff" | "fan:constantvolume" | "fan:variablevolume"
+        ) {
+            if let Some(p) = fan_power_spec(obj) {
+                c.specs.insert(2.min(c.specs.len()), ("Power", p));
+            }
+        }
+        if lc == "coil:cooling:dx" {
+            dx_coil_specs(idx, obj, &mut c.specs);
+        }
     }
     c
+}
+
+/// New-style DX coil: capacity and COP live two references deep, on the
+/// CurveFit performance's base operating mode and its nominal speed.
+fn dx_coil_specs(idx: &Index, coil: &IdfObject, specs: &mut Vec<(&'static str, String)>) {
+    let Some(perf) = idx.find("Coil:Cooling:DX:CurveFit:Performance", coil.field(7)) else {
+        return;
+    };
+    let Some(mode) = idx.find("Coil:Cooling:DX:CurveFit:OperatingMode", perf.field(11)) else {
+        return;
+    };
+    if let Some(v) = fmt_spec(mode.field(1), Unit::TonsBtu) {
+        specs.push(("Capacity", v));
+    }
+    // Speed names start at field 12; blank nominal speed number means the
+    // highest speed.
+    let speeds: Vec<&str> = mode.fields[12.min(mode.fields.len())..]
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let nominal = mode
+        .field_f64(11)
+        .map(|n| (n as usize).clamp(1, speeds.len().max(1)) - 1)
+        .unwrap_or(speeds.len().saturating_sub(1));
+    if let Some(name) = speeds.get(nominal) {
+        if let Some(speed) = idx.find("Coil:Cooling:DX:CurveFit:Speed", name) {
+            if let Some(v) = fmt_spec(speed.field(5), Unit::Plain) {
+                specs.push(("COP", v));
+            }
+        }
+    }
+}
+
+/// Expand an AirLoopHVAC:UnitarySystem into its fan/coil chain, in flow order
+/// (fan placement decides where the fan sits; supplemental coil is last). The
+/// unitary's branch inlet/outlet nodes go to the first/last child; interior
+/// connections use auto-generated nodes the IDF doesn't name, so those stay
+/// blank. Each child carries `group` (and a back-reference) to the unitary.
+fn expand_unitary(idx: &Index, unitary: &Component, obj: &IdfObject) -> Vec<Component> {
+    let fan = (obj.field(7), obj.field(8));
+    let blow_through = !obj.field(9).eq_ignore_ascii_case("DrawThrough");
+    let heat = (obj.field(11), obj.field(12));
+    let cool = (obj.field(14), obj.field(15));
+    let supp = (obj.field(19), obj.field(20));
+
+    let mut order: Vec<(&str, &str)> = Vec::new();
+    if blow_through && !fan.1.is_empty() {
+        order.push(fan);
+    }
+    for pair in [cool, heat] {
+        if !pair.1.is_empty() {
+            order.push(pair);
+        }
+    }
+    if !blow_through && !fan.1.is_empty() {
+        order.push(fan);
+    }
+    if !supp.1.is_empty() {
+        order.push(supp);
+    }
+    if order.is_empty() {
+        return vec![unitary.clone()];
+    }
+
+    let n = order.len();
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(i, (class, name))| {
+            let inlet = if i == 0 { unitary.inlet.as_str() } else { "" };
+            let outlet = if i == n - 1 { unitary.outlet.as_str() } else { "" };
+            let mut c = make_component(idx, class, name, inlet, outlet);
+            c.group = Some(unitary.name.clone());
+            c.children.push(ChildRef {
+                class: unitary.class.clone(),
+                name: unitary.name.clone(),
+                raw: unitary.raw.clone(),
+                line: unitary.line,
+            });
+            c
+        })
+        .collect()
 }
 
 /// Does this branch field start the component quads? Component object types
@@ -339,13 +494,19 @@ fn branch_components(idx: &Index, branch: &IdfObject) -> Vec<Component> {
     }
     let mut comps = Vec::new();
     while i + 1 < f.len() {
-        comps.push(make_component(
+        let c = make_component(
             idx,
             &f[i],
             &f[i + 1],
             f.get(i + 2).map(String::as_str).unwrap_or(""),
             f.get(i + 3).map(String::as_str).unwrap_or(""),
-        ));
+        );
+        if eq(&c.class, "AirLoopHVAC:UnitarySystem") && c.found {
+            let obj = idx.find(&c.class, &c.name).expect("found implies present");
+            comps.extend(expand_unitary(idx, &c, obj));
+        } else {
+            comps.push(c);
+        }
         i += 4;
     }
     comps
@@ -515,6 +676,7 @@ fn zone_component(idx: &Index, zc: &ZoneConn, inlet: &str) -> Component {
         found: true,
         children: Vec::new(),
         specs: Vec::new(),
+        group: None,
     };
     if let Some(el) = idx.find("ZoneHVAC:EquipmentList", &zc.equip_list) {
         collect_children(idx, el, &mut c.children);
@@ -834,9 +996,18 @@ Branch, Sys 1 Main Branch, ,
   AirLoopHVAC:UnitarySystem, Sys 1 Unitary, Sys 1 Air Loop Inlet, Sys 1 Fan Outlet;
 AirLoopHVAC:UnitarySystem,
   Sys 1 Unitary, Load, Zone 1, , , Sys 1 Air Loop Inlet, Sys 1 Fan Outlet,
-  Fan:OnOff, Sys 1 Fan, BlowThrough, , Coil:Heating:Fuel, Sys 1 HC;
-Fan:OnOff, Sys 1 Fan;
+  Fan:OnOff, Sys 1 Fan, BlowThrough, , Coil:Heating:Fuel, Sys 1 HC, ,
+  Coil:Cooling:DX, Sys 1 CC;
+Fan:OnOff, Sys 1 Fan, , 0.6, 622.72, 4.7195, 0.9;
 Coil:Heating:Fuel, Sys 1 HC;
+Coil:Cooling:DX, Sys 1 CC, CC Inlet, CC Outlet, , , Cond In, Cond Out, Sys 1 CC Perf;
+Coil:Cooling:DX:CurveFit:Performance,
+  Sys 1 CC Perf, 0, , -25, 10, , Discrete, 0, 2, , Electricity, Sys 1 CC Mode;
+Coil:Cooling:DX:CurveFit:OperatingMode,
+  Sys 1 CC Mode, 70337, autosize, autosize, 0, 0, 0, 0, No, AirCooled, 0, 2,
+  Sys 1 CC Speed 1, Sys 1 CC Speed 2;
+Coil:Cooling:DX:CurveFit:Speed, Sys 1 CC Speed 1, 0.5, 0.5, 0.5, autosize, 4.5;
+Coil:Cooling:DX:CurveFit:Speed, Sys 1 CC Speed 2, 1.0, 1.0, 1.0, autosize, 3.8;
 
 AirLoopHVAC:SupplyPath, Sys 1 Supply Path, Sys 1 Supply Path Inlet,
   AirLoopHVAC:ZoneSplitter, Sys 1 Splitter;
@@ -865,11 +1036,41 @@ AirTerminal:SingleDuct:ConstantVolume:NoReheat,
 
         let supply = &l.sides[0];
         assert_eq!(supply.series_in.len(), 1);
-        let unitary = &supply.series_in[0].components[0];
-        assert_eq!(unitary.class, "AirLoopHVAC:UnitarySystem");
-        // Fan and heating coil discovered as children of the unitary system.
-        assert!(unitary.children.iter().any(|c| c.name == "Sys 1 Fan"));
-        assert!(unitary.children.iter().any(|c| c.name == "Sys 1 HC"));
+        // The unitary system is expanded into its fan/coil chain: blow-through
+        // fan first, then cooling coil, then heating coil, all grouped under
+        // the unitary.
+        let comps = &supply.series_in[0].components;
+        assert_eq!(comps.len(), 3);
+        let fan = &comps[0];
+        assert_eq!(fan.class, "Fan:OnOff");
+        assert_eq!(fan.group.as_deref(), Some("Sys 1 Unitary"));
+        assert_eq!(fan.inlet, "Sys 1 Air Loop Inlet");
+        assert_eq!(
+            fan.specs,
+            vec![
+                ("Flow", "10,000 CFM".to_string()),
+                ("ΔP", "2.5 in. w.c.".to_string()),
+                ("Power", "4.9 kW (6.57 hp)".to_string()),
+                ("Motor eff", "90%".to_string()),
+                ("Fan eff", "60%".to_string()),
+            ]
+        );
+        // Back-reference to the unitary parent for the details panel.
+        assert!(fan.children.iter().any(|c| c.name == "Sys 1 Unitary"));
+        // New-style DX coil: capacity from the operating mode, COP from the
+        // nominal (2nd) speed.
+        let cc = &comps[1];
+        assert_eq!(cc.class, "Coil:Cooling:DX");
+        assert_eq!(
+            cc.specs,
+            vec![
+                ("Capacity", "20 tons (240 kBtu/h)".to_string()),
+                ("COP", "3.8".to_string()),
+            ]
+        );
+        let hc = &comps[2];
+        assert_eq!(hc.class, "Coil:Heating:Fuel");
+        assert_eq!(hc.outlet, "Sys 1 Fan Outlet");
 
         let demand = &l.sides[1];
         assert!(demand.splitter.is_some());

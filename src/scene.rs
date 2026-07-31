@@ -412,10 +412,11 @@ impl SceneRenderer {
 
     fn paint(&self, pass: &mut wgpu::RenderPass<'static>) {
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-
+        // Zero-size buffers (a model with no surfaces) cannot be sliced, so
+        // the vertex buffer is only bound inside count-guarded branches.
         if self.opaque_count > 0 {
             pass.set_pipeline(&self.mesh_pipeline);
+            pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
             pass.set_index_buffer(self.opaque_idx.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.opaque_count, 0, 0..1);
         }

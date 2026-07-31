@@ -1113,6 +1113,15 @@ impl App {
                     }
                 }
             }
+            // Compound-parent brackets, behind the boxes they enclose.
+            for (r, _) in &l.groups {
+                painter.rect_stroke(
+                    tr(*r),
+                    7.0 * zoom,
+                    egui::Stroke::new((1.0 * zoom).clamp(0.4, 1.6), Color32::from_gray(100)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             for (r, path, _) in &l.bars {
                 let sr = tr(*r);
                 let selected = self.loop_comp == Some(*path);
@@ -1152,37 +1161,33 @@ impl App {
                     painter.text(
                         egui::pos2(sr.center().x, sr.top() + 5.0 * zoom),
                         egui::Align2::CENTER_TOP,
-                        trunc(&c.class, 36),
+                        trunc(&c.class, 40),
                         egui::FontId::proportional(class_px),
                         Color32::from_gray(160),
                     );
                 }
-                // Sizing line (capacity/flow/head) between class and name.
+                // Sizing rows (capacity/flow/head/...) between class and name.
                 let spec_px = 9.5 * zoom;
                 if !c.specs.is_empty() && spec_px > 4.5 {
-                    let line = if c.specs.iter().all(|(_, v)| v == "autosized") {
-                        "autosized".to_string()
-                    } else {
-                        c.specs
-                            .iter()
-                            .map(|(_, v)| v.clone())
-                            .collect::<Vec<_>>()
-                            .join(" · ")
-                    };
-                    painter.text(
-                        sr.center() + egui::vec2(0.0, 1.0 * zoom),
-                        egui::Align2::CENTER_CENTER,
-                        trunc(&line, 30),
-                        egui::FontId::proportional(spec_px),
-                        Color32::from_rgb(170, 195, 220),
-                    );
+                    for (i, line) in spec_lines(&c.specs, SPEC_CHARS, SPEC_MAX_ROWS)
+                        .iter()
+                        .enumerate()
+                    {
+                        painter.text(
+                            egui::pos2(sr.center().x, sr.top() + (17.0 + i as f32 * 11.0) * zoom),
+                            egui::Align2::CENTER_TOP,
+                            line,
+                            egui::FontId::proportional(spec_px),
+                            Color32::from_rgb(170, 195, 220),
+                        );
+                    }
                 }
                 let name_px = 11.5 * zoom;
                 if name_px > 5.0 {
                     painter.text(
                         egui::pos2(sr.center().x, sr.bottom() - 8.0 * zoom),
                         egui::Align2::CENTER_BOTTOM,
-                        trunc(&c.name, 28),
+                        trunc(&c.name, 32),
                         egui::FontId::proportional(name_px),
                         Color32::from_gray(230),
                     );
@@ -1692,14 +1697,22 @@ impl App {
                             + l.sides.iter().map(|s| s.parallel.len()).sum::<usize>()
                     })
                     .map(|(i, _)| i);
+                // Select the supply-side component with the most sizing info
+                // (e.g. the fan) so the shot shows the spec rows and panel.
                 self.loop_comp = self.loop_sel.and_then(|i| {
-                    let p = CompPath {
+                    let b = self.model.loops[i].sides.first()?.series_in.first()?;
+                    let ci = b
+                        .components
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, c)| c.specs.len())
+                        .map(|(ci, _)| ci)?;
+                    Some(CompPath {
                         side: 0,
                         seg: Seg::SeriesIn,
                         branch: 0,
-                        comp: 0,
-                    };
-                    comp_in(&self.model.loops[i], p).is_some().then_some(p)
+                        comp: ci,
+                    })
                 });
                 self.loop_fit_pending = true;
             }
@@ -1724,10 +1737,16 @@ impl App {
 
 // --- loop schematic layout (world coordinates, pixels at zoom 1) ------------
 
-const BOX_W: f32 = 180.0;
-const BOX_H: f32 = 54.0;
+const BOX_W: f32 = 200.0;
+/// Minimum box height (no sizing rows); each spec row adds SPEC_ROW_H.
+const BOX_H: f32 = 48.0;
+const SPEC_ROW_H: f32 = 11.0;
+/// Character budget per sizing row inside a box. Conservative for the
+/// proportional font at BOX_W, so rows never spill past the border.
+const SPEC_CHARS: usize = 34;
+const SPEC_MAX_ROWS: usize = 3;
 const GAP_X: f32 = 46.0;
-const GAP_Y: f32 = 26.0;
+const GAP_Y: f32 = 30.0;
 const BAR_W: f32 = 10.0;
 const STUB: f32 = 80.0;
 const SIDE_GAP: f32 = 120.0;
@@ -1742,31 +1761,63 @@ struct SideLayout {
     lines: Vec<([egui::Pos2; 2], String)>,
     /// (anchor, right-aligned?, text, font size at zoom 1)
     labels: Vec<(egui::Pos2, bool, String, f32)>,
+    /// Bracket outlines around runs of boxes expanded from one compound
+    /// component (e.g. a unitary system), with its name.
+    groups: Vec<(egui::Rect, String)>,
     width: f32,
     height: f32,
     inlet: egui::Pos2,
     outlet: egui::Pos2,
 }
 
+/// Height of a component's box: base plus one row per line of sizing info.
+fn box_h(c: &LoopPart) -> f32 {
+    let rows = if c.specs.is_empty() {
+        0
+    } else {
+        spec_lines(&c.specs, SPEC_CHARS, SPEC_MAX_ROWS).len()
+    };
+    BOX_H + SPEC_ROW_H * rows as f32
+}
+
 /// Place one side left-to-right: inlet stub, series branches, splitter bar,
 /// stacked parallel branches, mixer bar, series branches, outlet stub.
+/// Box heights vary with how many sizing rows each component shows.
 fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
     let n_rows = side.parallel.len();
+    let branch_h =
+        |b: &BranchView| b.components.iter().map(box_h).fold(BOX_H, f32::max);
+    let row_h: Vec<f32> = side.parallel.iter().map(branch_h).collect();
     let rows_h = if n_rows > 0 {
-        n_rows as f32 * (BOX_H + GAP_Y) - GAP_Y
+        row_h.iter().sum::<f32>() + (n_rows - 1) as f32 * GAP_Y
     } else {
         0.0
     };
-    let height = rows_h.max(BOX_H);
+    let series_h = side
+        .series_in
+        .iter()
+        .chain(&side.series_out)
+        .map(branch_h)
+        .fold(BOX_H, f32::max);
+    let height = rows_h.max(series_h);
     let cy = y_top + height / 2.0;
-    let row_cy =
-        |k: usize| y_top + (height - rows_h) / 2.0 + k as f32 * (BOX_H + GAP_Y) + BOX_H / 2.0;
+    let row_cys: Vec<f32> = {
+        let mut ys = Vec::with_capacity(n_rows);
+        let mut top = y_top + (height - rows_h) / 2.0;
+        for h in &row_h {
+            ys.push(top + h / 2.0);
+            top += h + GAP_Y;
+        }
+        ys
+    };
+    let row_cy = |k: usize| row_cys[k];
 
     let mut out = SideLayout {
         boxes: Vec::new(),
         bars: Vec::new(),
         lines: Vec::new(),
         labels: Vec::new(),
+        groups: Vec::new(),
         width: 0.0,
         height,
         inlet: egui::pos2(0.0, cy),
@@ -1785,9 +1836,9 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
             for (ci, c) in b.components.iter().enumerate() {
                 out.lines
                     .push(([egui::pos2(*px, cy), egui::pos2(*x, cy)], c.inlet.clone()));
-                let r = egui::Rect::from_min_size(
-                    egui::pos2(*x, cy - BOX_H / 2.0),
-                    egui::vec2(BOX_W, BOX_H),
+                let r = egui::Rect::from_center_size(
+                    egui::pos2(*x + BOX_W / 2.0, cy),
+                    egui::vec2(BOX_W, box_h(c)),
                 );
                 out.boxes.push((
                     r,
@@ -1843,9 +1894,9 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
             for (ci, c) in b.components.iter().enumerate() {
                 out.lines
                     .push(([egui::pos2(rpx, ry), egui::pos2(rx, ry)], c.inlet.clone()));
-                let r = egui::Rect::from_min_size(
-                    egui::pos2(rx, ry - BOX_H / 2.0),
-                    egui::vec2(BOX_W, BOX_H),
+                let r = egui::Rect::from_center_size(
+                    egui::pos2(rx + BOX_W / 2.0, ry),
+                    egui::vec2(BOX_W, box_h(c)),
                 );
                 out.boxes.push((
                     r,
@@ -1905,6 +1956,47 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
     ));
     out.outlet = egui::pos2(out.width, cy);
 
+    // Bracket consecutive boxes expanded from the same compound parent
+    // (same branch, same group name).
+    let comp_of = |p: &CompPath| -> Option<&LoopPart> {
+        let list = match p.seg {
+            Seg::SeriesIn => &side.series_in,
+            Seg::Parallel => &side.parallel,
+            Seg::SeriesOut => &side.series_out,
+            _ => return None,
+        };
+        list.get(p.branch)?.components.get(p.comp)
+    };
+    let mut run: Option<(egui::Rect, String, Seg, usize)> = None;
+    let boxes: Vec<(egui::Rect, CompPath)> = out.boxes.clone();
+    let mut flushed: Vec<(egui::Rect, String)> = Vec::new();
+    for (r, p) in boxes {
+        let g = comp_of(&p).and_then(|c| c.group.clone());
+        let same = matches!(
+            (&run, &g),
+            (Some((_, rg, rseg, rbranch)), Some(g)) if rg == g && *rseg == p.seg && *rbranch == p.branch
+        );
+        if same {
+            if let Some((rr, ..)) = &mut run {
+                *rr = rr.union(r);
+            }
+        } else {
+            if let Some((rr, rg, ..)) = run.take() {
+                flushed.push((rr, rg));
+            }
+            run = g.map(|g| (r, g, p.seg, p.branch));
+        }
+    }
+    if let Some((rr, rg, ..)) = run.take() {
+        flushed.push((rr, rg));
+    }
+    for (rr, rg) in flushed {
+        let gr = rr.expand2(egui::vec2(11.0, 8.0));
+        out.labels
+            .push((egui::pos2(gr.min.x + 2.0, gr.min.y - 3.0), false, rg.clone(), 10.0));
+        out.groups.push((gr, rg));
+    }
+
     let mut title = side.label.clone();
     if n_rows > 1 {
         title.push_str(&format!("  ·  {n_rows} parallel paths"));
@@ -1927,6 +2019,9 @@ fn mirror_layout(l: &mut SideLayout, w: f32) {
         flip_rect(r);
     }
     for (r, _, _) in &mut l.bars {
+        flip_rect(r);
+    }
+    for (r, _) in &mut l.groups {
         flip_rect(r);
     }
     for (seg, _) in &mut l.lines {
@@ -1957,6 +2052,40 @@ fn flow_arrow(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, zoom: f32, 
     let stroke = egui::Stroke::new((1.4 * zoom).clamp(0.4, 2.5), color);
     painter.line_segment([tip, base + n * s], stroke);
     painter.line_segment([tip, base - n * s], stroke);
+}
+
+/// Build the in-box sizing rows: greedy-wrap the spec values into at most
+/// `max_lines` lines of `max_chars`. Bare percentages get a short label
+/// ("Motor 90%") since two unlabeled percents would be ambiguous; when every
+/// value is "autosized" the whole thing collapses to a single word.
+fn spec_lines(specs: &[(&'static str, String)], max_chars: usize, max_lines: usize) -> Vec<String> {
+    if specs.len() > 1 && specs.iter().all(|(_, v)| v == "autosized") {
+        return vec!["autosized".to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for (k, v) in specs {
+        // Percentages and bare numbers (COP, ...) need their label to be
+        // readable in a joined row; unit-carrying values speak for themselves.
+        let part = if v.ends_with('%') || !v.chars().any(|ch| ch.is_ascii_alphabetic()) {
+            format!("{} {v}", k.split_whitespace().next().unwrap_or(k))
+        } else {
+            v.clone()
+        };
+        match lines.last_mut() {
+            Some(l) if l.chars().count() + 3 + part.chars().count() <= max_chars => {
+                l.push_str(" · ");
+                l.push_str(&part);
+            }
+            _ => lines.push(part),
+        }
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(l) = lines.last_mut() {
+            l.push('…');
+        }
+    }
+    lines
 }
 
 fn trunc(s: &str, max: usize) -> String {

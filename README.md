@@ -89,8 +89,15 @@ it comes straight from the IDF — no `.bnd` file needed.
 
 - Every connection carries a node dot; hovering it pops the node name in a
   readable callout. Click a component for its nodes, referenced sub-objects
-  (fan and coils of a unitary system, controllers of an OA system, a zone's
-  equipment list), and raw IDF text; hover for a quick node tooltip.
+  (controllers of an OA system, a zone's equipment list), and raw IDF text;
+  hover for a quick node tooltip.
+- Unitary systems are expanded into their fan/coil chain in flow order
+  (respecting blow-through/draw-through placement), with a labeled bracket
+  around the run.
+- Equipment boxes show key sizing converted to IP units: chiller tons and
+  GPM, boiler kBtu/h and GPM, pump GPM and head in ft, fan CFM, ΔP,
+  power, and motor/fan efficiencies, cooling tower and water coil flows,
+  and more (`spec_defs` in `src/loops.rs`).
 - Zone boxes have a **Show zone in 3D** button that jumps to the 3D view
   filtered to that zone.
 - Node-connection mismatches within a branch and unreferenced/missing branch

@@ -49,6 +49,8 @@ pub struct Component {
     pub line: usize,
     pub found: bool,
     pub children: Vec<ChildRef>,
+    /// Key sizing values in IP units, e.g. ("Capacity", "500 tons").
+    pub specs: Vec<(&'static str, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +195,112 @@ fn collect_children(idx: &Index, obj: &IdfObject, out: &mut Vec<ChildRef>) {
     }
 }
 
+// --- equipment sizing specs -------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Unit {
+    /// W → tons of refrigeration
+    Tons,
+    /// W → kBtu/h
+    KBtuH,
+    /// m3/s water → GPM
+    Gpm,
+    /// Pa pump head → ft of water
+    FtHead,
+    /// m3/s air → CFM
+    Cfm,
+    /// Pa fan pressure → in. w.c.
+    InH2O,
+    /// m3 → gal
+    Gal,
+}
+
+/// Sizing fields worth surfacing, per class: (field index, label, unit).
+/// Indices are 0-based with the object name at index 0, verified against the
+/// 24.2 IDD field order.
+fn spec_defs(class: &str) -> &'static [(usize, &'static str, Unit)] {
+    use Unit::*;
+    match class.to_ascii_lowercase().as_str() {
+        "chiller:electric:eir" | "chiller:electric:reformulatedeir" => {
+            &[(1, "Capacity", Tons), (5, "CHW flow", Gpm)]
+        }
+        "chiller:constantcop" => &[(1, "Capacity", Tons), (3, "CHW flow", Gpm)],
+        "chiller:electric" => &[(2, "Capacity", Tons), (14, "CHW flow", Gpm)],
+        "chiller:absorption" => &[(1, "Capacity", Tons), (11, "CHW flow", Gpm)],
+        "chiller:absorption:indirect" => &[(1, "Capacity", Tons), (13, "CHW flow", Gpm)],
+        "boiler:hotwater" => &[(2, "Capacity", KBtuH), (6, "Flow", Gpm)],
+        "boiler:steam" => &[(5, "Capacity", KBtuH)],
+        "pump:variablespeed" | "pump:constantspeed" => &[(3, "Flow", Gpm), (4, "Head", FtHead)],
+        "headeredpumps:variablespeed" | "headeredpumps:constantspeed" => {
+            &[(3, "Total flow", Gpm), (6, "Head", FtHead)]
+        }
+        "coolingtower:singlespeed" | "coolingtower:twospeed" => &[(3, "Water flow", Gpm)],
+        "coolingtower:variablespeed" => &[(8, "Water flow", Gpm)],
+        "coil:cooling:water" => &[(2, "Water flow", Gpm)],
+        "coil:heating:water" => &[(3, "Water flow", Gpm), (9, "Capacity", KBtuH)],
+        "districtcooling" => &[(3, "Capacity", Tons)],
+        "districtheating" | "districtheating:water" | "districtheating:steam" => {
+            &[(3, "Capacity", KBtuH)]
+        }
+        "waterheater:mixed" => &[(1, "Tank", Gal), (6, "Heater", KBtuH)],
+        "fan:variablevolume" | "fan:constantvolume" | "fan:onoff" => {
+            &[(4, "Flow", Cfm), (3, "ΔP", InH2O)]
+        }
+        "fan:systemmodel" => &[(4, "Flow", Cfm), (7, "ΔP", InH2O)],
+        _ => &[],
+    }
+}
+
+/// Format with thousands separators and just enough precision.
+fn fmt_num(v: f64) -> String {
+    let s = if v >= 100.0 {
+        format!("{:.0}", v)
+    } else if v >= 10.0 {
+        format!("{:.1}", v)
+    } else {
+        format!("{:.2}", v)
+    };
+    let s = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    };
+    let (int, frac) = s.split_once('.').map_or((s.as_str(), None), |(i, f)| (i, Some(f)));
+    let mut out = String::new();
+    for (n, ch) in int.chars().enumerate() {
+        if n > 0 && (int.len() - n) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if let Some(f) = frac {
+        out.push('.');
+        out.push_str(f);
+    }
+    out
+}
+
+fn fmt_spec(raw: &str, unit: Unit) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.eq_ignore_ascii_case("autosize") || t.eq_ignore_ascii_case("autocalculate") {
+        return Some("autosized".to_string());
+    }
+    let v: f64 = t.parse().ok()?;
+    let (v, suffix) = match unit {
+        Unit::Tons => (v / 3516.85, "tons"),
+        Unit::KBtuH => (v / 293.071, "kBtu/h"),
+        Unit::Gpm => (v * 15850.32, "GPM"),
+        Unit::FtHead => (v / 2989.07, "ft"),
+        Unit::Cfm => (v * 2118.88, "CFM"),
+        Unit::InH2O => (v / 249.089, "in. w.c."),
+        Unit::Gal => (v * 264.172, "gal"),
+    };
+    Some(format!("{} {}", fmt_num(v), suffix))
+}
+
 fn make_component(idx: &Index, class: &str, name: &str, inlet: &str, outlet: &str) -> Component {
     let mut c = Component {
         class: class.to_string(),
@@ -206,6 +314,11 @@ fn make_component(idx: &Index, class: &str, name: &str, inlet: &str, outlet: &st
         c.line = obj.line;
         c.found = true;
         collect_children(idx, obj, &mut c.children);
+        for &(i, label, unit) in spec_defs(&obj.class) {
+            if let Some(v) = fmt_spec(obj.field(i), unit) {
+                c.specs.push((label, v));
+            }
+        }
     }
     c
 }
@@ -401,6 +514,7 @@ fn zone_component(idx: &Index, zc: &ZoneConn, inlet: &str) -> Component {
         line: zc.obj.line,
         found: true,
         children: Vec::new(),
+        specs: Vec::new(),
     };
     if let Some(el) = idx.find("ZoneHVAC:EquipmentList", &zc.equip_list) {
         collect_children(idx, el, &mut c.children);
@@ -672,8 +786,8 @@ Branch, Coil Branch, ,
 Branch, CHW Demand Outlet Branch, ,
   Pipe:Adiabatic, CHW Demand Outlet Pipe, Demand Mix Outlet, CHW Demand Outlet;
 
-Pump:ConstantSpeed, CHW Pump, CHW Supply Inlet, CHW Pump Outlet;
-Chiller:Electric:EIR, Chiller 1;
+Pump:ConstantSpeed, CHW Pump, CHW Supply Inlet, CHW Pump Outlet, 0.06309, 179344;
+Chiller:Electric:EIR, Chiller 1, 1758425, 5.5, 6.67, 29.4, 0.06309, autosize;
 Pipe:Adiabatic, CHW Supply Bypass Pipe, Bypass Inlet, Bypass Outlet;
 Pipe:Adiabatic, CHW Supply Outlet Pipe, Mixer Outlet, CHW Supply Outlet;
 Pipe:Adiabatic, CHW Demand Inlet Pipe, CHW Demand Inlet, Demand Split Inlet;
@@ -693,9 +807,15 @@ Coil:Cooling:Water, CC-1;
         let supply = &l.sides[0];
         assert_eq!(supply.inlet_node, "CHW Supply Inlet");
         assert_eq!(supply.series_in.len(), 1);
-        assert_eq!(supply.series_in[0].components[0].class, "Pump:ConstantSpeed");
+        let pump = &supply.series_in[0].components[0];
+        assert_eq!(pump.class, "Pump:ConstantSpeed");
+        assert_eq!(pump.specs[0], ("Flow", "1,000 GPM".to_string()));
+        assert_eq!(pump.specs[1], ("Head", "60 ft".to_string()));
         assert_eq!(supply.parallel.len(), 2);
-        assert_eq!(supply.parallel[0].components[0].name, "Chiller 1");
+        let chiller = &supply.parallel[0].components[0];
+        assert_eq!(chiller.name, "Chiller 1");
+        assert_eq!(chiller.specs[0], ("Capacity", "500 tons".to_string()));
+        assert_eq!(chiller.specs[1], ("CHW flow", "1,000 GPM".to_string()));
         assert_eq!(supply.series_out.len(), 1);
         assert!(supply.splitter.is_some());
         assert!(supply.mixer.is_some());

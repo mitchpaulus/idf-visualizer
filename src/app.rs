@@ -936,6 +936,9 @@ impl App {
                 }
                 row("Class", c.class.clone());
                 row("Name", c.name.clone());
+                for (k, v) in &c.specs {
+                    row(k, v.clone());
+                }
                 if !c.inlet.is_empty() {
                     row("Inlet node", c.inlet.clone());
                 }
@@ -1154,6 +1157,26 @@ impl App {
                         Color32::from_gray(160),
                     );
                 }
+                // Sizing line (capacity/flow/head) between class and name.
+                let spec_px = 9.5 * zoom;
+                if !c.specs.is_empty() && spec_px > 4.5 {
+                    let line = if c.specs.iter().all(|(_, v)| v == "autosized") {
+                        "autosized".to_string()
+                    } else {
+                        c.specs
+                            .iter()
+                            .map(|(_, v)| v.clone())
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    };
+                    painter.text(
+                        sr.center() + egui::vec2(0.0, 1.0 * zoom),
+                        egui::Align2::CENTER_CENTER,
+                        trunc(&line, 30),
+                        egui::FontId::proportional(spec_px),
+                        Color32::from_rgb(170, 195, 220),
+                    );
+                }
                 let name_px = 11.5 * zoom;
                 if name_px > 5.0 {
                     painter.text(
@@ -1222,9 +1245,17 @@ impl App {
                     c.inlet.clone(),
                     c.outlet.clone(),
                 );
+                let specs: Vec<String> = c
+                    .specs
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect();
                 response.clone().on_hover_ui_at_pointer(|ui| {
                     ui.strong(name);
                     ui.label(RichText::new(class).weak());
+                    for s in &specs {
+                        ui.label(RichText::new(s).small());
+                    }
                     if !inlet.is_empty() {
                         ui.label(RichText::new(format!("in:  {inlet}")).monospace().small());
                     }
@@ -1694,7 +1725,7 @@ impl App {
 // --- loop schematic layout (world coordinates, pixels at zoom 1) ------------
 
 const BOX_W: f32 = 180.0;
-const BOX_H: f32 = 48.0;
+const BOX_H: f32 = 54.0;
 const GAP_X: f32 = 46.0;
 const GAP_Y: f32 = 26.0;
 const BAR_W: f32 = 10.0;

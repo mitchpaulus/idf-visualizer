@@ -1787,13 +1787,119 @@ fn box_h(c: &LoopPart) -> f32 {
     BOX_H + SPEC_ROW_H * rows as f32
 }
 
+/// Vertical gap between boxes stacked in one column.
+const STACK_GAP: f32 = 14.0;
+/// Horizontal reach of the fan-out/fan-in tees around a stacked column.
+const TEE: f32 = 14.0;
+
+/// Split a run into columns: consecutive parallel taps of the same compound
+/// parent (`stacked` with equal `group`, e.g. WaterUse:Connections fixtures)
+/// share one column and are drawn stacked vertically; every other component
+/// is a column of its own.
+fn run_columns(comps: &[LoopPart]) -> Vec<std::ops::Range<usize>> {
+    let mut cols: Vec<std::ops::Range<usize>> = Vec::new();
+    for i in 0..comps.len() {
+        let merge = i > 0
+            && comps[i].stacked
+            && comps[i - 1].stacked
+            && comps[i].group.is_some()
+            && comps[i].group == comps[i - 1].group;
+        match cols.last_mut() {
+            Some(r) if merge => r.end = i + 1,
+            _ => cols.push(i..i + 1),
+        }
+    }
+    cols
+}
+
+fn column_h(comps: &[LoopPart]) -> f32 {
+    match comps {
+        [c] => box_h(c),
+        _ => comps.iter().map(box_h).sum::<f32>() + (comps.len() - 1) as f32 * STACK_GAP,
+    }
+}
+
+/// Height of a whole run, accounting for stacked columns.
+fn run_h(comps: &[LoopPart]) -> f32 {
+    run_columns(comps)
+        .into_iter()
+        .map(|r| column_h(&comps[r]))
+        .fold(BOX_H, f32::max)
+}
+
+/// Place one run of components left-to-right at center line `cy`, advancing
+/// `x` (next free position) and `px` (where the incoming flow line ends).
+/// A stacked column fans out through a vertical tee, one box per tap, and
+/// fans back in on the far side.
+fn place_run(
+    out: &mut SideLayout,
+    comps: &[LoopPart],
+    cy: f32,
+    x: &mut f32,
+    px: &mut f32,
+    mut path: impl FnMut(usize) -> CompPath,
+) {
+    for col in run_columns(comps) {
+        if col.len() == 1 {
+            let c = &comps[col.start];
+            out.lines
+                .push(([egui::pos2(*px, cy), egui::pos2(*x, cy)], c.inlet.clone()));
+            let r = egui::Rect::from_center_size(
+                egui::pos2(*x + BOX_W / 2.0, cy),
+                egui::vec2(BOX_W, box_h(c)),
+            );
+            out.boxes.push((r, path(col.start)));
+            *px = *x + BOX_W;
+            *x = *px + GAP_X;
+            continue;
+        }
+        let items = &comps[col.clone()];
+        let xa = *x; // fan-out tee
+        let x0 = xa + TEE; // box column
+        let xb = x0 + BOX_W + TEE; // fan-in tee
+        out.lines.push((
+            [egui::pos2(*px, cy), egui::pos2(xa, cy)],
+            items[0].inlet.clone(),
+        ));
+        let mut top = cy - column_h(items) / 2.0;
+        let (mut y_min, mut y_max) = (cy, cy);
+        for (k, c) in items.iter().enumerate() {
+            let bh = box_h(c);
+            let ycb = top + bh / 2.0;
+            y_min = y_min.min(ycb);
+            y_max = y_max.max(ycb);
+            out.lines
+                .push(([egui::pos2(xa, ycb), egui::pos2(x0, ycb)], c.inlet.clone()));
+            out.lines.push((
+                [egui::pos2(x0 + BOX_W, ycb), egui::pos2(xb, ycb)],
+                c.outlet.clone(),
+            ));
+            let r = egui::Rect::from_center_size(
+                egui::pos2(x0 + BOX_W / 2.0, ycb),
+                egui::vec2(BOX_W, bh),
+            );
+            out.boxes.push((r, path(col.start + k)));
+            top += bh + STACK_GAP;
+        }
+        out.lines.push((
+            [egui::pos2(xa, y_min), egui::pos2(xa, y_max)],
+            items[0].inlet.clone(),
+        ));
+        out.lines.push((
+            [egui::pos2(xb, y_min), egui::pos2(xb, y_max)],
+            items[items.len() - 1].outlet.clone(),
+        ));
+        *px = xb;
+        *x = *px + GAP_X;
+    }
+}
+
 /// Place one side left-to-right: inlet stub, series branches, splitter bar,
 /// stacked parallel branches, mixer bar, series branches, outlet stub.
 /// Box heights vary with how many sizing rows each component shows.
 fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
     let n_rows = side.parallel.len();
-    let branch_h =
-        |b: &BranchView| b.components.iter().map(box_h).fold(BOX_H, f32::max);
+    let branch_h = |b: &BranchView| run_h(&b.components);
     let row_h: Vec<f32> = side.parallel.iter().map(branch_h).collect();
     let rows_h = if n_rows > 0 {
         row_h.iter().sum::<f32>() + (n_rows - 1) as f32 * GAP_Y
@@ -1840,25 +1946,12 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
                             px: &mut f32,
                             out: &mut SideLayout| {
         for (bi, b) in branches.iter().enumerate() {
-            for (ci, c) in b.components.iter().enumerate() {
-                out.lines
-                    .push(([egui::pos2(*px, cy), egui::pos2(*x, cy)], c.inlet.clone()));
-                let r = egui::Rect::from_center_size(
-                    egui::pos2(*x + BOX_W / 2.0, cy),
-                    egui::vec2(BOX_W, box_h(c)),
-                );
-                out.boxes.push((
-                    r,
-                    CompPath {
-                        side: side_idx,
-                        seg,
-                        branch: bi,
-                        comp: ci,
-                    },
-                ));
-                *px = *x + BOX_W;
-                *x = *px + GAP_X;
-            }
+            place_run(out, &b.components, cy, x, px, |ci| CompPath {
+                side: side_idx,
+                seg,
+                branch: bi,
+                comp: ci,
+            });
         }
     };
 
@@ -1898,25 +1991,12 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
             let ry = row_cy(bi);
             let mut rx = row_x0;
             let mut rpx = bar_right;
-            for (ci, c) in b.components.iter().enumerate() {
-                out.lines
-                    .push(([egui::pos2(rpx, ry), egui::pos2(rx, ry)], c.inlet.clone()));
-                let r = egui::Rect::from_center_size(
-                    egui::pos2(rx + BOX_W / 2.0, ry),
-                    egui::vec2(BOX_W, box_h(c)),
-                );
-                out.boxes.push((
-                    r,
-                    CompPath {
-                        side: side_idx,
-                        seg: Seg::Parallel,
-                        branch: bi,
-                        comp: ci,
-                    },
-                ));
-                rpx = rx + BOX_W;
-                rx = rpx + GAP_X;
-            }
+            place_run(&mut out, &b.components, ry, &mut rx, &mut rpx, |ci| CompPath {
+                side: side_idx,
+                seg: Seg::Parallel,
+                branch: bi,
+                comp: ci,
+            });
             row_end[bi] = rpx;
             max_right = max_right.max(rpx);
         }
@@ -1968,30 +2048,17 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
     // leaves the system.
     let mut ay = y_top + height;
     for (bi, b) in side.aux.iter().enumerate() {
-        let run_h = b.components.iter().map(box_h).fold(BOX_H, f32::max);
-        ay += AUX_GAP + run_h / 2.0;
+        let h = run_h(&b.components);
+        ay += AUX_GAP + h / 2.0;
         let x0 = STUB;
         let mut rx = x0;
         let mut rpx = x0 - 40.0;
-        for (ci, c) in b.components.iter().enumerate() {
-            out.lines
-                .push(([egui::pos2(rpx, ay), egui::pos2(rx, ay)], c.inlet.clone()));
-            let r = egui::Rect::from_center_size(
-                egui::pos2(rx + BOX_W / 2.0, ay),
-                egui::vec2(BOX_W, box_h(c)),
-            );
-            out.boxes.push((
-                r,
-                CompPath {
-                    side: side_idx,
-                    seg: Seg::Aux,
-                    branch: bi,
-                    comp: ci,
-                },
-            ));
-            rpx = rx + BOX_W;
-            rx = rpx + GAP_X;
-        }
+        place_run(&mut out, &b.components, ay, &mut rx, &mut rpx, |ci| CompPath {
+            side: side_idx,
+            seg: Seg::Aux,
+            branch: bi,
+            comp: ci,
+        });
         let node = b
             .components
             .last()
@@ -2000,13 +2067,13 @@ fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
         out.lines
             .push(([egui::pos2(rpx, ay), egui::pos2(rpx + 40.0, ay)], node));
         out.labels.push((
-            egui::pos2(x0 - 40.0, ay - run_h / 2.0 - 5.0),
+            egui::pos2(x0 - 40.0, ay - h / 2.0 - 5.0),
             false,
             b.name.clone(),
             10.0,
         ));
         out.width = out.width.max(rpx + 40.0);
-        ay += run_h / 2.0;
+        ay += h / 2.0;
     }
     out.height = ay - y_top;
 
@@ -2178,6 +2245,8 @@ fn class_color(class: &str) -> Color32 {
         (235, 160, 70)
     } else if c.contains("waterheater") {
         (215, 130, 170)
+    } else if c.contains("wateruse") {
+        (100, 165, 210)
     } else if c.contains("humidifier") {
         (110, 200, 215)
     } else if c.contains("heatexchanger") {
@@ -2300,6 +2369,52 @@ mod tests {
                 assert!(!a.intersects(*b), "mirrored boxes overlap");
             }
         }
+    }
+
+    /// A DHW-style demand run: inlet pipe, then two water-use fixtures that
+    /// are parallel taps of one WaterUse:Connections. The fixtures share a
+    /// column, stacked vertically, and the run stays as tall as the stack.
+    #[test]
+    fn stacked_fixtures_share_a_column() {
+        let fixture = |name: &str| LoopPart {
+            class: "WaterUse:Equipment".to_string(),
+            name: name.to_string(),
+            group: Some("DHW Use Connections".to_string()),
+            stacked: true,
+            ..Default::default()
+        };
+        let side = Side {
+            label: "Demand side".to_string(),
+            series_in: vec![BranchView {
+                name: "use".to_string(),
+                components: vec![
+                    comp("Pipe:Adiabatic", "Inlet pipe"),
+                    fixture("Sinks"),
+                    fixture("Showers"),
+                ],
+            }],
+            ..Default::default()
+        };
+        let l = layout_side(&side, 0, 0.0);
+        assert_eq!(l.boxes.len(), 3);
+        let (pipe, sink, shower) = (&l.boxes[0].0, &l.boxes[1].0, &l.boxes[2].0);
+        // Fixtures occupy one x column to the right of the pipe, separated
+        // vertically, both inside the side's height.
+        assert_eq!(sink.min.x, shower.min.x);
+        assert!(sink.min.x > pipe.max.x);
+        assert!(sink.max.y <= shower.min.y - STACK_GAP);
+        assert!(l.height >= column_h(&side.series_in[0].components[1..]));
+        for (i, (a, _)) in l.boxes.iter().enumerate() {
+            for (b, _) in &l.boxes[i + 1..] {
+                assert!(!a.intersects(*b), "boxes overlap: {a:?} vs {b:?}");
+            }
+        }
+        // The stack is bracketed as one group.
+        assert_eq!(l.groups.len(), 1);
+        let (gr, name) = &l.groups[0];
+        assert_eq!(name, "DHW Use Connections");
+        assert!(gr.contains_rect(*sink) && gr.contains_rect(*shower));
+        assert!(!gr.intersects(*pipe));
     }
 }
 

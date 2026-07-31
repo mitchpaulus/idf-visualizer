@@ -54,6 +54,10 @@ pub struct Component {
     /// Name of the compound parent this box was expanded out of
     /// (e.g. an AirLoopHVAC:UnitarySystem); drawn as a bracket around the run.
     pub group: Option<String>,
+    /// Parallel tap within its group (a WaterUse:Connections fixture) rather
+    /// than a series stage; consecutive stacked boxes of one group are drawn
+    /// as a vertical stack between fan-out/fan-in tees.
+    pub stacked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +226,8 @@ enum Unit {
     Gal,
     /// fraction → %
     Pct,
+    /// °C → °F
+    DegF,
     /// W → kW
     Kw,
     /// W → tons and kBtu/h together
@@ -269,6 +275,7 @@ fn spec_defs(class: &str) -> &'static [(usize, &'static str, Unit)] {
             (4, "Lat eff", Pct),
         ],
         "waterheater:mixed" => &[(1, "Tank", Gal), (6, "Heater", KBtuH)],
+        "wateruse:equipment" => &[(2, "Peak flow", Gpm)],
         "fan:constantvolume" | "fan:onoff" => &[
             (4, "Flow", Cfm),
             (3, "ΔP", InH2O),
@@ -339,6 +346,7 @@ fn fmt_spec(raw: &str, unit: Unit) -> Option<String> {
         Unit::InH2O => (v / 249.089, "in. w.c."),
         Unit::Gal => (v * 264.172, "gal"),
         Unit::Pct => (v * 100.0, "%"),
+        Unit::DegF => (v * 9.0 / 5.0 + 32.0, "°F"),
         Unit::Kw => return Some(fmt_power(v)),
         Unit::TonsBtu => {
             return Some(format!(
@@ -349,7 +357,7 @@ fn fmt_spec(raw: &str, unit: Unit) -> Option<String> {
         }
         Unit::Plain => return Some(fmt_num(v)),
     };
-    if matches!(unit, Unit::Pct) {
+    if matches!(unit, Unit::Pct | Unit::DegF) {
         return Some(format!("{}{}", fmt_num(v), suffix));
     }
     Some(format!("{} {}", fmt_num(v), suffix))
@@ -402,8 +410,29 @@ fn make_component(idx: &Index, class: &str, name: &str, inlet: &str, outlet: &st
         if lc == "coil:cooling:dx" {
             dx_coil_specs(idx, obj, &mut c.specs);
         }
+        if lc == "waterheater:mixed" {
+            push_schedule_temp(idx, obj.field(2), "Setpoint", &mut c.specs);
+        }
+        if lc == "wateruse:equipment" {
+            push_schedule_temp(idx, obj.field(4), "Target temp", &mut c.specs);
+        }
     }
     c
+}
+
+/// Temperature setpoints live behind a schedule name; a Schedule:Constant
+/// resolves to a single value worth showing on the box.
+fn push_schedule_temp(
+    idx: &Index,
+    sched: &str,
+    label: &'static str,
+    specs: &mut Vec<(&'static str, String)>,
+) {
+    if let Some(sc) = idx.find("Schedule:Constant", sched) {
+        if let Some(v) = fmt_spec(sc.field(2), Unit::DegF) {
+            specs.push((label, v));
+        }
+    }
 }
 
 /// New-style DX coil: capacity and COP live two references deep, on the
@@ -483,6 +512,38 @@ fn expand_unitary(idx: &Index, unitary: &Component, obj: &IdfObject) -> Vec<Comp
                 name: unitary.name.clone(),
                 raw: unitary.raw.clone(),
                 line: unitary.line,
+            });
+            c
+        })
+        .collect()
+}
+
+/// Expand a WaterUse:Connections into its WaterUse:Equipment fixtures. The
+/// fixtures are parallel draws sharing the connections' plant nodes, so every
+/// box carries the branch inlet/outlet and is marked `stacked` for parallel
+/// rendering; each shows its peak flow and target temperature and carries
+/// `group` (and a back-reference) to the connections object.
+fn expand_water_use(idx: &Index, conn: &Component, obj: &IdfObject) -> Vec<Component> {
+    // Equipment names start at field 10 and are name-only references.
+    let names: Vec<&str> = obj.fields[10.min(obj.fields.len())..]
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return vec![conn.clone()];
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let mut c = make_component(idx, "WaterUse:Equipment", name, &conn.inlet, &conn.outlet);
+            c.stacked = true;
+            c.group = Some(conn.name.clone());
+            c.children.push(ChildRef {
+                class: conn.class.clone(),
+                name: conn.name.clone(),
+                raw: conn.raw.clone(),
+                line: conn.line,
             });
             c
         })
@@ -682,6 +743,9 @@ fn branch_components(idx: &Index, branch: &IdfObject, aux: &mut Vec<BranchView>)
         if eq(&c.class, "AirLoopHVAC:UnitarySystem") && c.found {
             let obj = idx.find(&c.class, &c.name).expect("found implies present");
             comps.extend(expand_unitary(idx, &c, obj));
+        } else if eq(&c.class, "WaterUse:Connections") && c.found {
+            let obj = idx.find(&c.class, &c.name).expect("found implies present");
+            comps.extend(expand_water_use(idx, &c, obj));
         } else if eq(&c.class, "AirLoopHVAC:OutdoorAirSystem") && c.found {
             let obj = idx.find(&c.class, &c.name).expect("found implies present");
             let (main, relief) = expand_oa_system(idx, &c, obj);
@@ -869,6 +933,7 @@ fn zone_component(idx: &Index, zc: &ZoneConn, inlet: &str) -> Component {
         children: Vec::new(),
         specs: Vec::new(),
         group: None,
+        stacked: false,
     };
     if let Some(el) = idx.find("ZoneHVAC:EquipmentList", &zc.equip_list) {
         collect_children(idx, el, &mut c.children);
@@ -1407,6 +1472,91 @@ ZoneHVAC:EquipmentList, Zone 1 Equipment, SequentialLoad;
         assert_eq!(
             relief.components[0].group.as_deref(),
             Some("DOAS OA System")
+        );
+    }
+
+    // A service hot water loop: water heater on the supply side, fixtures
+    // behind a WaterUse:Connections on the demand side.
+    const DHW: &str = "\
+PlantLoop,
+  DHW Loop, Water, , DHW Ops, DHW Supply Outlet, 82.22, 5, autosize, 0, autocalculate,
+  DHW Supply Inlet, DHW Supply Outlet, DHW Supply Branches, ,
+  DHW Demand Inlet, DHW Demand Outlet, DHW Demand Branches, ;
+
+BranchList, DHW Supply Branches, DHW Heater Branch;
+Branch, DHW Heater Branch, ,
+  WaterHeater:Mixed, DHW Heater, DHW Supply Inlet, DHW Supply Outlet;
+WaterHeater:Mixed,
+  DHW Heater, 0.151416, DHW Supply Setpoint, 1.0, 82.22, Modulate, 58614;
+
+BranchList, DHW Demand Branches, DHW Use Branch;
+Branch, DHW Use Branch, ,
+  WaterUse:Connections, DHW Use Connections, DHW Demand Inlet, DHW Demand Outlet;
+WaterUse:Connections,
+  DHW Use Connections, DHW Demand Inlet, DHW Demand Outlet, , , , , None, Plant, ,
+  DHW Sink Use, DHW Shower Use;
+WaterUse:Equipment,
+  DHW Sink Use, DHW Sinks, 0.00006309, Sink Fractions, DHW Sink Target Temperature;
+WaterUse:Equipment,
+  DHW Shower Use, DHW Showers, 0.00164, Shower Fractions, DHW Shower Target Temperature;
+
+Schedule:Constant, DHW Supply Setpoint, Any Number, 60;
+Schedule:Constant, DHW Sink Target Temperature, Any Number, 43.33;
+Schedule:Constant, DHW Shower Target Temperature, Any Number, 37.78;
+";
+
+    #[test]
+    fn dhw_loop_water_use_expansion() {
+        let loops = build(&idf::parse(DHW));
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        assert_eq!(l.kind, LoopKind::Plant);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+
+        // The water heater box shows tank, capacity, and the setpoint
+        // resolved from its Schedule:Constant, in °F.
+        let heater = &l.sides[0].series_in[0].components[0];
+        assert_eq!(heater.class, "WaterHeater:Mixed");
+        assert_eq!(
+            heater.specs,
+            vec![
+                ("Tank", "40 gal".to_string()),
+                ("Heater", "200 kBtu/h".to_string()),
+                ("Setpoint", "140°F".to_string()),
+            ]
+        );
+
+        // The connections object is expanded into its fixtures, grouped
+        // under it and marked as a parallel stack; every fixture is a tap
+        // across the branch inlet/outlet.
+        let comps = &l.sides[1].series_in[0].components;
+        assert_eq!(comps.len(), 2);
+        let sink = &comps[0];
+        assert_eq!(sink.class, "WaterUse:Equipment");
+        assert_eq!(sink.name, "DHW Sink Use");
+        assert_eq!(sink.inlet, "DHW Demand Inlet");
+        assert_eq!(sink.outlet, "DHW Demand Outlet");
+        assert!(sink.stacked);
+        assert_eq!(sink.group.as_deref(), Some("DHW Use Connections"));
+        assert_eq!(
+            sink.specs,
+            vec![
+                ("Peak flow", "1 GPM".to_string()),
+                ("Target temp", "110°F".to_string()),
+            ]
+        );
+        assert!(sink.children.iter().any(|c| c.name == "DHW Use Connections"));
+        let shower = &comps[1];
+        assert_eq!(shower.name, "DHW Shower Use");
+        assert_eq!(shower.inlet, "DHW Demand Inlet");
+        assert_eq!(shower.outlet, "DHW Demand Outlet");
+        assert!(shower.stacked);
+        assert_eq!(
+            shower.specs,
+            vec![
+                ("Peak flow", "26 GPM".to_string()),
+                ("Target temp", "100°F".to_string()),
+            ]
         );
     }
 }

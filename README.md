@@ -1,7 +1,8 @@
 # idf-visualizer
 
-Fast, cross-platform 3D viewer for EnergyPlus IDF models. Visualization and
-debugging only — no editing. Built with Rust, wgpu, and egui.
+Fast, cross-platform 3D viewer for EnergyPlus IDF models, with an interactive
+HVAC loop schematic. Visualization and debugging only — no editing. Built with
+Rust, wgpu, and egui.
 
 ## Usage
 
@@ -74,15 +75,35 @@ Back-facing opaque surfaces are culled by default; since an EnergyPlus floor's
 outward normal points down, a roof-off cutaway usually wants `--no-cull` so
 floor plates show.
 
+## HVAC loop schematic
+
+The **HVAC loops** tab in the left panel lists every `PlantLoop`,
+`CondenserLoop`, and `AirLoopHVAC` in the file and draws the selected one as an
+interactive circuit diagram: supply side flowing left→right on top, demand side
+returning right→left below, dashed runs closing the loop. Series components,
+splitter/mixer bars, and parallel branches are laid out from the loop's
+`BranchList`/`Branch`/`Connector:Splitter`/`Connector:Mixer` objects; air loop
+demand sides are resolved through `AirLoopHVAC:SupplyPath`/`ReturnPath`, air
+distribution units, and `ZoneHVAC:EquipmentConnections` node matching. All of
+it comes straight from the IDF — no `.bnd` file needed.
+
+- Click a component for its nodes, referenced sub-objects (fan and coils of a
+  unitary system, controllers of an OA system, a zone's equipment list), and
+  raw IDF text; hover for a quick node tooltip.
+- Zone boxes have a **Show zone in 3D** button that jumps to the 3D view
+  filtered to that zone.
+- Node-connection mismatches within a branch and unreferenced/missing branch
+  objects are reported as loop warnings (the checks a `.bnd` would give you).
+
 ## Controls
 
 | Input | Action |
 |---|---|
-| Left-drag | Orbit |
+| Left-drag | Orbit (3D) / pan (loops) |
 | Shift-drag / right-drag / middle-drag | Pan |
 | Scroll | Zoom |
-| Click | Select surface (properties panel opens) |
-| `F` | Zoom to fit visible surfaces |
+| Click | Select surface or loop component (properties panel opens) |
+| `F` | Zoom to fit |
 | `Esc` | Deselect |
 
 ## Features

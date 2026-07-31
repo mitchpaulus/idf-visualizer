@@ -1,0 +1,768 @@
+//! HVAC loop topology (plant, condenser, and air loops) extracted from the IDF.
+//!
+//! Everything needed for a loop schematic is explicit in the IDF: each loop
+//! object names its supply/demand BranchList, each Branch lists components in
+//! flow order with inlet/outlet nodes, and Connector:Splitter/Mixer describe
+//! the parallel section. Air loop demand sides come from the SupplyPath /
+//! ReturnPath objects plus node-name matching against zone equipment. No .bnd
+//! file is required.
+
+use crate::idf::IdfObject;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopKind {
+    Plant,
+    Condenser,
+    Air,
+}
+
+impl LoopKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            LoopKind::Plant => "Plant",
+            LoopKind::Condenser => "Condenser",
+            LoopKind::Air => "Air",
+        }
+    }
+}
+
+/// A sub-object referenced by a component (fan and coils of a unitary system,
+/// controllers of an OA system, equipment of a zone, ...).
+#[derive(Debug, Clone)]
+pub struct ChildRef {
+    pub class: String,
+    pub name: String,
+    pub raw: String,
+    pub line: usize,
+}
+
+/// One box in the schematic: a branch component, a zone, or a terminal unit.
+#[derive(Debug, Clone, Default)]
+pub struct Component {
+    pub class: String,
+    pub name: String,
+    pub inlet: String,
+    pub outlet: String,
+    /// Raw IDF text of the referenced object; empty if not found in the file.
+    pub raw: String,
+    pub line: usize,
+    pub found: bool,
+    pub children: Vec<ChildRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchView {
+    pub name: String,
+    pub components: Vec<Component>,
+}
+
+/// One half-loop. Flow order: inlet node → series_in branches → splitter →
+/// parallel branches → mixer → series_out branches → outlet node. When there
+/// is no splitter every branch is in `series_in`.
+#[derive(Debug, Clone, Default)]
+pub struct Side {
+    pub label: String,
+    pub inlet_node: String,
+    pub outlet_node: String,
+    pub series_in: Vec<BranchView>,
+    pub parallel: Vec<BranchView>,
+    pub series_out: Vec<BranchView>,
+    pub splitter: Option<Component>,
+    pub mixer: Option<Component>,
+}
+
+impl Side {
+    pub fn branch_count(&self) -> usize {
+        self.series_in.len() + self.parallel.len() + self.series_out.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HvacLoop {
+    pub kind: LoopKind,
+    pub name: String,
+    /// Supply side first, then demand side.
+    pub sides: Vec<Side>,
+    pub raw: String,
+    pub line: usize,
+    pub warnings: Vec<String>,
+}
+
+// --- object index -----------------------------------------------------------
+
+struct Index<'a> {
+    objects: &'a [IdfObject],
+    /// lowercase class -> object indices
+    by_class: HashMap<String, Vec<usize>>,
+    /// (lowercase class, lowercase name) -> object index
+    by_name: HashMap<(String, String), usize>,
+}
+
+fn eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+impl<'a> Index<'a> {
+    fn new(objects: &'a [IdfObject]) -> Self {
+        let mut by_class: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_name = HashMap::new();
+        for (i, o) in objects.iter().enumerate() {
+            let c = o.class.to_ascii_lowercase();
+            by_class.entry(c.clone()).or_default().push(i);
+            by_name.insert((c, o.field(0).to_ascii_lowercase()), i);
+        }
+        Self {
+            objects,
+            by_class,
+            by_name,
+        }
+    }
+
+    fn find(&self, class: &str, name: &str) -> Option<&'a IdfObject> {
+        self.by_name
+            .get(&(class.to_ascii_lowercase(), name.to_ascii_lowercase()))
+            .map(|&i| &self.objects[i])
+    }
+
+    fn all(&self, class: &str) -> impl Iterator<Item = &'a IdfObject> + '_ {
+        self.by_class
+            .get(&class.to_ascii_lowercase())
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.objects[i])
+    }
+
+    fn has_class(&self, class: &str) -> bool {
+        self.by_class.contains_key(&class.to_ascii_lowercase())
+    }
+
+    /// A node field may hold either a node name or a NodeList name.
+    fn resolve_nodes(&self, name: &str) -> Vec<String> {
+        if name.is_empty() {
+            return Vec::new();
+        }
+        match self.find("NodeList", name) {
+            Some(nl) => nl.fields[1..]
+                .iter()
+                .filter(|f| !f.is_empty())
+                .cloned()
+                .collect(),
+            None => vec![name.to_string()],
+        }
+    }
+}
+
+// --- component construction -------------------------------------------------
+
+/// Collect (object type, object name) sub-references from `obj`. IDF encodes
+/// these as a field holding a class name (always containing ':') followed by
+/// the object's name.
+fn collect_children(idx: &Index, obj: &IdfObject, out: &mut Vec<ChildRef>) {
+    // OA systems reference their controllers and equipment through name-only
+    // list objects, so the type/name pair scan below can't see them; expand
+    // the lists instead.
+    if eq(&obj.class, "AirLoopHVAC:OutdoorAirSystem") {
+        for (list_class, field) in [
+            ("AirLoopHVAC:ControllerList", 1),
+            ("AirLoopHVAC:OutdoorAirSystem:EquipmentList", 2),
+        ] {
+            if let Some(list) = idx.find(list_class, obj.field(field)) {
+                collect_children(idx, list, out);
+            }
+        }
+    }
+    for i in 0..obj.fields.len().saturating_sub(1) {
+        let class = obj.field(i);
+        if class.contains(':') && idx.has_class(class) {
+            if let Some(child) = idx.find(class, obj.field(i + 1)) {
+                if out
+                    .iter()
+                    .any(|c| eq(&c.class, &child.class) && eq(&c.name, child.field(0)))
+                {
+                    continue;
+                }
+                out.push(ChildRef {
+                    class: child.class.clone(),
+                    name: child.field(0).to_string(),
+                    raw: child.raw.clone(),
+                    line: child.line,
+                });
+            }
+        }
+    }
+}
+
+fn make_component(idx: &Index, class: &str, name: &str, inlet: &str, outlet: &str) -> Component {
+    let mut c = Component {
+        class: class.to_string(),
+        name: name.to_string(),
+        inlet: inlet.to_string(),
+        outlet: outlet.to_string(),
+        ..Default::default()
+    };
+    if let Some(obj) = idx.find(class, name) {
+        c.raw = obj.raw.clone();
+        c.line = obj.line;
+        c.found = true;
+        collect_children(idx, obj, &mut c.children);
+    }
+    c
+}
+
+/// Does this branch field start the component quads? Component object types
+/// always contain ':' (Pump:VariableSpeed, Coil:Cooling:Water, ...).
+fn looks_like_component_type(s: &str) -> bool {
+    s.contains(':') || eq(s, "Duct")
+}
+
+fn branch_components(idx: &Index, branch: &IdfObject) -> Vec<Component> {
+    let f = &branch.fields;
+    // Skip leading non-component fields: pressure drop curve name, and in
+    // older IDFs a maximum flow rate.
+    let mut i = 1;
+    while i < f.len() && i <= 3 && !looks_like_component_type(&f[i]) {
+        i += 1;
+    }
+    let mut comps = Vec::new();
+    while i + 1 < f.len() {
+        comps.push(make_component(
+            idx,
+            &f[i],
+            &f[i + 1],
+            f.get(i + 2).map(String::as_str).unwrap_or(""),
+            f.get(i + 3).map(String::as_str).unwrap_or(""),
+        ));
+        i += 4;
+    }
+    comps
+}
+
+// --- side assembly ----------------------------------------------------------
+
+/// Node continuity within a series of components: each outlet should feed the
+/// next inlet. Mismatches are exactly what the .bnd would flag.
+fn check_series(loop_name: &str, branch: &BranchView, warnings: &mut Vec<String>) {
+    for w in branch.components.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if !a.outlet.is_empty() && !b.inlet.is_empty() && !eq(&a.outlet, &b.inlet) {
+            warnings.push(format!(
+                "{loop_name}, branch \"{}\": outlet of \"{}\" ({}) does not match inlet of \"{}\" ({})",
+                branch.name, a.name, a.outlet, b.name, b.inlet
+            ));
+        }
+        if !a.found {
+            warnings.push(format!(
+                "{loop_name}, branch \"{}\": component {} \"{}\" not found in file",
+                branch.name, a.class, a.name
+            ));
+        }
+    }
+    if let Some(last) = branch.components.last() {
+        if !last.found {
+            warnings.push(format!(
+                "{loop_name}, branch \"{}\": component {} \"{}\" not found in file",
+                branch.name, last.class, last.name
+            ));
+        }
+    }
+}
+
+fn build_side(
+    idx: &Index,
+    loop_name: &str,
+    label: &str,
+    inlet: &str,
+    outlet: &str,
+    branch_list: &str,
+    connector_list: &str,
+    warnings: &mut Vec<String>,
+) -> Side {
+    let mut side = Side {
+        label: label.to_string(),
+        inlet_node: inlet.to_string(),
+        outlet_node: outlet.to_string(),
+        ..Default::default()
+    };
+
+    let mut branches: Vec<BranchView> = Vec::new();
+    match idx.find("BranchList", branch_list) {
+        Some(bl) => {
+            for name in bl.fields[1..].iter().filter(|f| !f.is_empty()) {
+                match idx.find("Branch", name) {
+                    Some(br) => branches.push(BranchView {
+                        name: name.clone(),
+                        components: branch_components(idx, br),
+                    }),
+                    None => warnings.push(format!(
+                        "{loop_name} ({label}): Branch \"{name}\" not found"
+                    )),
+                }
+            }
+        }
+        None if !branch_list.is_empty() => warnings.push(format!(
+            "{loop_name} ({label}): BranchList \"{branch_list}\" not found"
+        )),
+        None => {}
+    }
+    for b in &branches {
+        check_series(loop_name, b, warnings);
+    }
+
+    // Locate the splitter and mixer via the connector list.
+    let mut splitter: Option<&IdfObject> = None;
+    let mut mixer: Option<&IdfObject> = None;
+    if let Some(cl) = idx.find("ConnectorList", connector_list) {
+        let mut i = 1;
+        while i + 1 < cl.fields.len() {
+            let (ctype, cname) = (cl.field(i), cl.field(i + 1));
+            match idx.find(ctype, cname) {
+                Some(o) if ctype.to_ascii_lowercase().contains("splitter") => splitter = Some(o),
+                Some(o) if ctype.to_ascii_lowercase().contains("mixer") => mixer = Some(o),
+                Some(_) => {}
+                None if !cname.is_empty() => warnings.push(format!(
+                    "{loop_name} ({label}): connector {ctype} \"{cname}\" not found"
+                )),
+                None => {}
+            }
+            i += 2;
+        }
+    }
+
+    let Some(sp) = splitter else {
+        side.series_in = branches;
+        return side;
+    };
+
+    let sp_inlet = sp.field(1);
+    let sp_outlets: Vec<&str> = sp.fields[2..].iter().map(String::as_str).collect();
+    let mx_outlet = mixer.map(|m| m.field(1)).unwrap_or("");
+    let take = |branches: &mut Vec<BranchView>, name: &str| -> Option<BranchView> {
+        branches
+            .iter()
+            .position(|b| eq(&b.name, name))
+            .map(|i| branches.remove(i))
+    };
+
+    match take(&mut branches, sp_inlet) {
+        Some(b) => side.series_in.push(b),
+        None => warnings.push(format!(
+            "{loop_name} ({label}): splitter inlet branch \"{sp_inlet}\" not in branch list"
+        )),
+    }
+    for name in sp_outlets {
+        match take(&mut branches, name) {
+            Some(b) => side.parallel.push(b),
+            None => warnings.push(format!(
+                "{loop_name} ({label}): splitter outlet branch \"{name}\" not in branch list"
+            )),
+        }
+    }
+    if !mx_outlet.is_empty() {
+        match take(&mut branches, mx_outlet) {
+            Some(b) => side.series_out.push(b),
+            None => warnings.push(format!(
+                "{loop_name} ({label}): mixer outlet branch \"{mx_outlet}\" not in branch list"
+            )),
+        }
+    }
+    for b in branches {
+        warnings.push(format!(
+            "{loop_name} ({label}): branch \"{}\" not referenced by splitter/mixer",
+            b.name
+        ));
+        side.series_out.push(b);
+    }
+
+    side.splitter = Some(make_component(idx, &sp.class, sp.field(0), sp_inlet, ""));
+    if let Some(m) = mixer {
+        side.mixer = Some(make_component(idx, &m.class, m.field(0), "", m.field(1)));
+    }
+    side
+}
+
+// --- air loop demand side ---------------------------------------------------
+
+struct ZoneConn<'a> {
+    obj: &'a IdfObject,
+    zone: String,
+    inlets: Vec<String>,
+    returns: Vec<String>,
+    equip_list: String,
+}
+
+fn zone_component(idx: &Index, zc: &ZoneConn, inlet: &str) -> Component {
+    let mut c = Component {
+        class: "Zone".to_string(),
+        name: zc.zone.clone(),
+        inlet: inlet.to_string(),
+        outlet: zc.returns.first().cloned().unwrap_or_default(),
+        raw: zc.obj.raw.clone(),
+        line: zc.obj.line,
+        found: true,
+        children: Vec::new(),
+    };
+    if let Some(el) = idx.find("ZoneHVAC:EquipmentList", &zc.equip_list) {
+        collect_children(idx, el, &mut c.children);
+    }
+    c
+}
+
+fn air_demand_side(
+    idx: &Index,
+    loop_name: &str,
+    inlet: &str,
+    outlet: &str,
+    warnings: &mut Vec<String>,
+) -> Side {
+    let mut side = Side {
+        label: "Demand side".to_string(),
+        inlet_node: inlet.to_string(),
+        outlet_node: outlet.to_string(),
+        ..Default::default()
+    };
+    let inlets = idx.resolve_nodes(inlet);
+
+    // Splitter outlets from the supply path(s) feeding this loop's demand
+    // inlet node(s). A path component is a ZoneSplitter or a SupplyPlenum.
+    let mut outlets: Vec<String> = Vec::new();
+    for path in idx.all("AirLoopHVAC:SupplyPath") {
+        if !inlets.iter().any(|n| eq(n, path.field(1))) {
+            continue;
+        }
+        let mut i = 2;
+        while i + 1 < path.fields.len() {
+            let (ctype, cname) = (path.field(i), path.field(i + 1));
+            if let Some(o) = idx.find(ctype, cname) {
+                let first_outlet = if ctype.to_ascii_lowercase().contains("plenum") {
+                    4 // SupplyPlenum: name, zone, zone node, inlet, outlets...
+                } else {
+                    2 // ZoneSplitter: name, inlet, outlets...
+                };
+                outlets.extend(
+                    o.fields[first_outlet.min(o.fields.len())..]
+                        .iter()
+                        .filter(|f| !f.is_empty())
+                        .cloned(),
+                );
+                if side.splitter.is_none() {
+                    side.splitter = Some(make_component(idx, ctype, cname, path.field(1), ""));
+                }
+            } else {
+                warnings.push(format!(
+                    "{loop_name} (demand): supply path component {ctype} \"{cname}\" not found"
+                ));
+            }
+            i += 2;
+        }
+    }
+
+    // Zone connections and air distribution units, for node matching.
+    let zones: Vec<ZoneConn> = idx
+        .all("ZoneHVAC:EquipmentConnections")
+        .map(|o| ZoneConn {
+            obj: o,
+            zone: o.field(0).to_string(),
+            inlets: idx.resolve_nodes(o.field(2)),
+            returns: idx.resolve_nodes(o.field(5)),
+            equip_list: o.field(1).to_string(),
+        })
+        .collect();
+    let adus: Vec<&IdfObject> = idx.all("ZoneHVAC:AirDistributionUnit").collect();
+
+    for node in &outlets {
+        // Direct connection: the splitter outlet is a zone inlet node.
+        if let Some(zc) = zones.iter().find(|z| z.inlets.iter().any(|n| eq(n, node))) {
+            side.parallel.push(BranchView {
+                name: zc.zone.clone(),
+                components: vec![zone_component(idx, zc, node)],
+            });
+            continue;
+        }
+        // Through a terminal unit: ADU whose terminal references this node.
+        let hit = adus.iter().find_map(|adu| {
+            let (ttype, tname) = (adu.field(2), adu.field(3));
+            let term = idx.find(ttype, tname)?;
+            term.fields
+                .iter()
+                .any(|f| eq(f, node))
+                .then_some((adu, term))
+        });
+        if let Some((adu, term)) = hit {
+            let adu_outlet = adu.field(1);
+            let mut comps = vec![make_component(
+                idx,
+                &term.class,
+                term.field(0),
+                node,
+                adu_outlet,
+            )];
+            let zc = zones
+                .iter()
+                .find(|z| z.inlets.iter().any(|n| eq(n, adu_outlet)));
+            let name = match zc {
+                Some(zc) => {
+                    comps.push(zone_component(idx, zc, adu_outlet));
+                    zc.zone.clone()
+                }
+                None => {
+                    warnings.push(format!(
+                        "{loop_name} (demand): no zone found for terminal \"{}\"",
+                        term.field(0)
+                    ));
+                    term.field(0).to_string()
+                }
+            };
+            side.parallel.push(BranchView {
+                name,
+                components: comps,
+            });
+        } else {
+            warnings.push(format!(
+                "{loop_name} (demand): no zone or terminal found for supply path outlet \"{node}\""
+            ));
+            side.parallel.push(BranchView {
+                name: node.clone(),
+                components: vec![Component {
+                    class: "?".to_string(),
+                    name: node.clone(),
+                    inlet: node.clone(),
+                    outlet: String::new(),
+                    ..Default::default()
+                }],
+            });
+        }
+    }
+    if side.parallel.is_empty() {
+        warnings.push(format!("{loop_name} (demand): no supply path found"));
+    }
+
+    // Mixer from the return path ending at the demand outlet node.
+    for path in idx.all("AirLoopHVAC:ReturnPath") {
+        if !eq(path.field(1), outlet) {
+            continue;
+        }
+        let (ctype, cname) = (path.field(2), path.field(3));
+        if idx.find(ctype, cname).is_some() {
+            side.mixer = Some(make_component(idx, ctype, cname, "", outlet));
+        }
+        break;
+    }
+    side
+}
+
+// --- entry point ------------------------------------------------------------
+
+pub fn build(objects: &[IdfObject]) -> Vec<HvacLoop> {
+    let idx = Index::new(objects);
+    let mut loops = Vec::new();
+
+    for (class, kind) in [
+        ("PlantLoop", LoopKind::Plant),
+        ("CondenserLoop", LoopKind::Condenser),
+    ] {
+        for o in idx.all(class) {
+            let name = o.field(0).to_string();
+            let mut warnings = Vec::new();
+            let sides = vec![
+                build_side(
+                    &idx,
+                    &name,
+                    "Supply side",
+                    o.field(10),
+                    o.field(11),
+                    o.field(12),
+                    o.field(13),
+                    &mut warnings,
+                ),
+                build_side(
+                    &idx,
+                    &name,
+                    "Demand side",
+                    o.field(14),
+                    o.field(15),
+                    o.field(16),
+                    o.field(17),
+                    &mut warnings,
+                ),
+            ];
+            loops.push(HvacLoop {
+                kind,
+                name,
+                sides,
+                raw: o.raw.clone(),
+                line: o.line,
+                warnings,
+            });
+        }
+    }
+
+    for o in idx.all("AirLoopHVAC") {
+        let name = o.field(0).to_string();
+        let mut warnings = Vec::new();
+        let supply_outlet = idx
+            .resolve_nodes(o.field(9))
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let supply = build_side(
+            &idx,
+            &name,
+            "Supply side",
+            o.field(6),
+            &supply_outlet,
+            o.field(4),
+            o.field(5),
+            &mut warnings,
+        );
+        let demand = air_demand_side(&idx, &name, o.field(8), o.field(7), &mut warnings);
+        loops.push(HvacLoop {
+            kind: LoopKind::Air,
+            name,
+            sides: vec![supply, demand],
+            raw: o.raw.clone(),
+            line: o.line,
+            warnings,
+        });
+    }
+
+    loops.sort_by(|a, b| {
+        (a.kind.label(), a.name.to_ascii_lowercase())
+            .cmp(&(b.kind.label(), b.name.to_ascii_lowercase()))
+    });
+    loops
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::idf;
+
+    const CHW: &str = "\
+PlantLoop,
+  CHW Loop, Water, , CHW Ops, CHW Supply Outlet, 98, 1, autosize, 0, autosize,
+  CHW Supply Inlet, CHW Supply Outlet, CHW Supply Branches, CHW Supply Connectors,
+  CHW Demand Inlet, CHW Demand Outlet, CHW Demand Branches, CHW Demand Connectors;
+
+BranchList, CHW Supply Branches,
+  CHW Pump Branch, Chiller Branch, CHW Supply Bypass, CHW Supply Outlet Branch;
+ConnectorList, CHW Supply Connectors,
+  Connector:Splitter, CHW Supply Splitter, Connector:Mixer, CHW Supply Mixer;
+Connector:Splitter, CHW Supply Splitter, CHW Pump Branch, Chiller Branch, CHW Supply Bypass;
+Connector:Mixer, CHW Supply Mixer, CHW Supply Outlet Branch, Chiller Branch, CHW Supply Bypass;
+
+Branch, CHW Pump Branch, ,
+  Pump:ConstantSpeed, CHW Pump, CHW Supply Inlet, CHW Pump Outlet;
+Branch, Chiller Branch, ,
+  Chiller:Electric:EIR, Chiller 1, Chiller Inlet, Chiller Outlet;
+Branch, CHW Supply Bypass, ,
+  Pipe:Adiabatic, CHW Supply Bypass Pipe, Bypass Inlet, Bypass Outlet;
+Branch, CHW Supply Outlet Branch, ,
+  Pipe:Adiabatic, CHW Supply Outlet Pipe, Mixer Outlet, CHW Supply Outlet;
+
+BranchList, CHW Demand Branches, CHW Demand Inlet Branch, Coil Branch, CHW Demand Outlet Branch;
+ConnectorList, CHW Demand Connectors,
+  Connector:Splitter, CHW Demand Splitter, Connector:Mixer, CHW Demand Mixer;
+Connector:Splitter, CHW Demand Splitter, CHW Demand Inlet Branch, Coil Branch;
+Connector:Mixer, CHW Demand Mixer, CHW Demand Outlet Branch, Coil Branch;
+Branch, CHW Demand Inlet Branch, ,
+  Pipe:Adiabatic, CHW Demand Inlet Pipe, CHW Demand Inlet, Demand Split Inlet;
+Branch, Coil Branch, ,
+  Coil:Cooling:Water, CC-1, Coil Water Inlet, Coil Water Outlet;
+Branch, CHW Demand Outlet Branch, ,
+  Pipe:Adiabatic, CHW Demand Outlet Pipe, Demand Mix Outlet, CHW Demand Outlet;
+
+Pump:ConstantSpeed, CHW Pump, CHW Supply Inlet, CHW Pump Outlet;
+Chiller:Electric:EIR, Chiller 1;
+Pipe:Adiabatic, CHW Supply Bypass Pipe, Bypass Inlet, Bypass Outlet;
+Pipe:Adiabatic, CHW Supply Outlet Pipe, Mixer Outlet, CHW Supply Outlet;
+Pipe:Adiabatic, CHW Demand Inlet Pipe, CHW Demand Inlet, Demand Split Inlet;
+Pipe:Adiabatic, CHW Demand Outlet Pipe, Demand Mix Outlet, CHW Demand Outlet;
+Coil:Cooling:Water, CC-1;
+";
+
+    #[test]
+    fn plant_loop_topology() {
+        let loops = build(&idf::parse(CHW));
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        assert_eq!(l.kind, LoopKind::Plant);
+        assert_eq!(l.name, "CHW Loop");
+        assert_eq!(l.sides.len(), 2);
+
+        let supply = &l.sides[0];
+        assert_eq!(supply.inlet_node, "CHW Supply Inlet");
+        assert_eq!(supply.series_in.len(), 1);
+        assert_eq!(supply.series_in[0].components[0].class, "Pump:ConstantSpeed");
+        assert_eq!(supply.parallel.len(), 2);
+        assert_eq!(supply.parallel[0].components[0].name, "Chiller 1");
+        assert_eq!(supply.series_out.len(), 1);
+        assert!(supply.splitter.is_some());
+        assert!(supply.mixer.is_some());
+
+        let demand = &l.sides[1];
+        assert_eq!(demand.parallel.len(), 1);
+        assert_eq!(demand.parallel[0].components[0].name, "CC-1");
+    }
+
+    const AIR: &str = "\
+AirLoopHVAC,
+  Sys 1, , , autosize, Sys 1 Branches, ,
+  Sys 1 Air Loop Inlet, Sys 1 Return Outlet, Sys 1 Supply Path Inlet, Sys 1 Fan Outlet;
+BranchList, Sys 1 Branches, Sys 1 Main Branch;
+Branch, Sys 1 Main Branch, ,
+  AirLoopHVAC:UnitarySystem, Sys 1 Unitary, Sys 1 Air Loop Inlet, Sys 1 Fan Outlet;
+AirLoopHVAC:UnitarySystem,
+  Sys 1 Unitary, Load, Zone 1, , , Sys 1 Air Loop Inlet, Sys 1 Fan Outlet,
+  Fan:OnOff, Sys 1 Fan, BlowThrough, , Coil:Heating:Fuel, Sys 1 HC;
+Fan:OnOff, Sys 1 Fan;
+Coil:Heating:Fuel, Sys 1 HC;
+
+AirLoopHVAC:SupplyPath, Sys 1 Supply Path, Sys 1 Supply Path Inlet,
+  AirLoopHVAC:ZoneSplitter, Sys 1 Splitter;
+AirLoopHVAC:ZoneSplitter, Sys 1 Splitter, Sys 1 Supply Path Inlet, Zone 1 Equip Inlet;
+AirLoopHVAC:ReturnPath, Sys 1 Return Path, Sys 1 Return Outlet,
+  AirLoopHVAC:ZoneMixer, Sys 1 Mixer;
+AirLoopHVAC:ZoneMixer, Sys 1 Mixer, Sys 1 Return Outlet, Zone 1 Return;
+
+ZoneHVAC:EquipmentConnections,
+  Zone 1, Zone 1 Equipment, Zone 1 Supply Inlet, , Zone 1 Air Node, Zone 1 Return;
+ZoneHVAC:EquipmentList, Zone 1 Equipment, SequentialLoad,
+  ZoneHVAC:AirDistributionUnit, Zone 1 ADU, 1, 1;
+ZoneHVAC:AirDistributionUnit, Zone 1 ADU, Zone 1 Supply Inlet,
+  AirTerminal:SingleDuct:ConstantVolume:NoReheat, Zone 1 CV;
+AirTerminal:SingleDuct:ConstantVolume:NoReheat,
+  Zone 1 CV, , Zone 1 Equip Inlet, Zone 1 Supply Inlet, autosize;
+";
+
+    #[test]
+    fn air_loop_topology() {
+        let loops = build(&idf::parse(AIR));
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        assert_eq!(l.kind, LoopKind::Air);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+
+        let supply = &l.sides[0];
+        assert_eq!(supply.series_in.len(), 1);
+        let unitary = &supply.series_in[0].components[0];
+        assert_eq!(unitary.class, "AirLoopHVAC:UnitarySystem");
+        // Fan and heating coil discovered as children of the unitary system.
+        assert!(unitary.children.iter().any(|c| c.name == "Sys 1 Fan"));
+        assert!(unitary.children.iter().any(|c| c.name == "Sys 1 HC"));
+
+        let demand = &l.sides[1];
+        assert!(demand.splitter.is_some());
+        assert!(demand.mixer.is_some());
+        assert_eq!(demand.parallel.len(), 1);
+        let row = &demand.parallel[0];
+        assert_eq!(row.name, "Zone 1");
+        assert_eq!(row.components.len(), 2);
+        assert_eq!(
+            row.components[0].class,
+            "AirTerminal:SingleDuct:ConstantVolume:NoReheat"
+        );
+        assert_eq!(row.components[1].class, "Zone");
+        assert_eq!(row.components[1].outlet, "Zone 1 Return");
+    }
+}

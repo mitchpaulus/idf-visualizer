@@ -2,6 +2,7 @@ mod analysis;
 mod app;
 mod camera;
 mod idf;
+mod loops;
 mod model;
 mod scene;
 mod svg;
@@ -74,14 +75,20 @@ fn load(path: &str, quiet: bool) -> anyhow::Result<model::Model> {
         return Ok(m);
     }
     println!(
-        "{}: {} objects, {} surfaces in {:.1} ms",
+        "{}: {} objects, {} surfaces, {} HVAC loops in {:.1} ms",
         path,
         objects.len(),
         m.surfaces.len(),
+        m.loops.len(),
         t0.elapsed().as_secs_f64() * 1000.0
     );
     for w in &m.warnings {
         println!("warning: {w}");
+    }
+    for l in &m.loops {
+        for w in &l.warnings {
+            println!("loop \"{}\" [{}]: {}", l.name, l.kind.label(), w);
+        }
     }
     for s in &m.surfaces {
         for p in &s.problems {

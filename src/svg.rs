@@ -601,6 +601,7 @@ mod tests {
         let model = Model {
             surfaces: vec![floor, roof],
             warnings: vec![],
+            ..Default::default()
         };
         let opt = SvgOptions {
             rotation: 0.0,
@@ -643,6 +644,7 @@ mod tests {
         let model = Model {
             surfaces: vec![wall, win],
             warnings: vec![],
+            ..Default::default()
         };
         let opt = SvgOptions {
             rotation: 30.0,
@@ -703,6 +705,7 @@ mod tests {
         let model = Model {
             surfaces: vec![south_wall(), north_wall()],
             warnings: vec![],
+            ..Default::default()
         };
         let opt = SvgOptions {
             rotation: 0.0,
@@ -720,6 +723,7 @@ mod tests {
         let model = Model {
             surfaces: vec![north_wall()],
             warnings: vec![],
+            ..Default::default()
         };
         let from_south = SvgOptions {
             rotation: 0.0,
@@ -739,6 +743,7 @@ mod tests {
         let model = Model {
             surfaces: vec![south_wall()],
             warnings: vec![],
+            ..Default::default()
         };
         let opt = SvgOptions {
             rotation: 0.0,
@@ -763,6 +768,7 @@ mod tests {
         let model = Model {
             surfaces: vec![south_wall(), roof],
             warnings: vec![],
+            ..Default::default()
         };
         let opt = SvgOptions {
             rotation: 0.0,
@@ -787,6 +793,7 @@ mod tests {
         let model = Model {
             surfaces: vec![win, south_wall()],
             warnings: vec![],
+            ..Default::default()
         };
         let opt = SvgOptions {
             rotation: 0.0,

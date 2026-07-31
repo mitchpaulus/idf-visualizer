@@ -1,6 +1,7 @@
 //! egui application: viewport, side panels, selection, filtering, demo mode.
 
 use crate::camera::{ray_triangle, OrbitCamera};
+use crate::loops::{BranchView, Component as LoopPart, HvacLoop, LoopKind, Side};
 use crate::model::{Model, ProblemKind, Severity, Surface, SurfaceType};
 use crate::scene::{self, SceneRenderer, Uniforms, Vertex, ViewCallback};
 use crate::svg::{self, SvgOptions};
@@ -35,6 +36,50 @@ impl ColorMode {
             ColorMode::Problems => "Problems",
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Scene,
+    Loops,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seg {
+    SeriesIn,
+    Parallel,
+    SeriesOut,
+    Splitter,
+    Mixer,
+}
+
+/// Location of a component box within the selected loop's schematic.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CompPath {
+    side: usize,
+    seg: Seg,
+    branch: usize,
+    comp: usize,
+}
+
+fn comp_in(hl: &HvacLoop, p: CompPath) -> Option<&LoopPart> {
+    let side = hl.sides.get(p.side)?;
+    match p.seg {
+        Seg::Splitter => side.splitter.as_ref(),
+        Seg::Mixer => side.mixer.as_ref(),
+        _ => branch_in(hl, p)?.components.get(p.comp),
+    }
+}
+
+fn branch_in(hl: &HvacLoop, p: CompPath) -> Option<&BranchView> {
+    let side = hl.sides.get(p.side)?;
+    let list = match p.seg {
+        Seg::SeriesIn => &side.series_in,
+        Seg::Parallel => &side.parallel,
+        Seg::SeriesOut => &side.series_out,
+        _ => return None,
+    };
+    list.get(p.branch)
 }
 
 fn severity_color(sev: Severity) -> Color32 {
@@ -108,6 +153,14 @@ pub struct App {
     /// egui time of the last "Copy CLI" click, for the transient confirmation.
     copied_at: Option<f64>,
     demo: Option<Demo>,
+    tab: Tab,
+    loop_sel: Option<usize>,
+    loop_comp: Option<CompPath>,
+    loop_filter: String,
+    /// Schematic view transform: screen = panel origin + pan + world * zoom.
+    loop_pan: egui::Vec2,
+    loop_zoom: f32,
+    loop_fit_pending: bool,
 }
 
 struct Demo {
@@ -193,6 +246,13 @@ impl App {
 
         Self {
             visible: vec![true; n],
+            tab: Tab::Scene,
+            loop_sel: (!model.loops.is_empty()).then_some(0),
+            loop_comp: None,
+            loop_filter: String::new(),
+            loop_pan: egui::Vec2::ZERO,
+            loop_zoom: 1.0,
+            loop_fit_pending: true,
             model,
             file_name,
             file_path,
@@ -546,6 +606,21 @@ impl App {
     fn left_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("IDF Visualizer");
         ui.label(RichText::new(&self.file_name).weak());
+        if !self.model.loops.is_empty() {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Scene, "3D model");
+                ui.selectable_value(
+                    &mut self.tab,
+                    Tab::Loops,
+                    format!("HVAC loops ({})", self.model.loops.len()),
+                );
+            });
+            ui.separator();
+        }
+        if self.tab == Tab::Loops {
+            self.loops_panel(ui);
+            return;
+        }
         let shown = self.visible.iter().filter(|&&v| v).count();
         ui.label(format!(
             "{shown} of {} surfaces shown",
@@ -718,6 +793,449 @@ impl App {
         if changed {
             self.recompute_visibility();
         }
+    }
+
+    // --- HVAC loop schematic ------------------------------------------------
+
+    fn loops_panel(&mut self, ui: &mut egui::Ui) {
+        let mut text = self.loop_filter.clone();
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("filter loops")
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            self.loop_filter = text;
+        }
+        ui.separator();
+
+        if let Some(i) = self.loop_sel {
+            let l = &self.model.loops[i];
+            ui.strong(&l.name);
+            ui.label(RichText::new(format!("{} loop · IDF line {}", l.kind.label(), l.line)).weak());
+            for s in &l.sides {
+                let comps: usize = s
+                    .series_in
+                    .iter()
+                    .chain(&s.parallel)
+                    .chain(&s.series_out)
+                    .map(|b| b.components.len())
+                    .sum();
+                ui.label(format!(
+                    "{}: {} branches, {} components",
+                    s.label,
+                    s.branch_count(),
+                    comps
+                ));
+                for (tag, node) in [("in", &s.inlet_node), ("out", &s.outlet_node)] {
+                    if !node.is_empty() {
+                        ui.label(
+                            RichText::new(format!("  {tag}: {node}")).monospace().small().weak(),
+                        );
+                    }
+                }
+            }
+            if !l.warnings.is_empty() {
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("⚠ Loop warnings ({})", l.warnings.len()))
+                        .color(Color32::YELLOW),
+                )
+                .show(ui, |ui| {
+                    for w in &l.warnings {
+                        ui.label(w);
+                    }
+                });
+            }
+            egui::CollapsingHeader::new("Raw IDF").show(ui, |ui| {
+                egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&l.raw).monospace().small())
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+            });
+            ui.label(
+                RichText::new("Click a component in the diagram for details.")
+                    .weak()
+                    .small(),
+            );
+            ui.separator();
+        }
+
+        let filter = self.loop_filter.to_ascii_lowercase();
+        egui::ScrollArea::vertical()
+            .id_salt("loops_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for kind in [LoopKind::Air, LoopKind::Plant, LoopKind::Condenser] {
+                    let items: Vec<usize> = self
+                        .model
+                        .loops
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| {
+                            l.kind == kind
+                                && (filter.is_empty()
+                                    || l.name.to_ascii_lowercase().contains(&filter))
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if items.is_empty() {
+                        continue;
+                    }
+                    egui::CollapsingHeader::new(format!(
+                        "{} loops ({})",
+                        kind.label(),
+                        items.len()
+                    ))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for i in items {
+                            let name = self.model.loops[i].name.clone();
+                            let is_sel = self.loop_sel == Some(i);
+                            if ui.selectable_label(is_sel, name).clicked() {
+                                self.loop_sel = Some(i);
+                                self.loop_comp = None;
+                                self.loop_fit_pending = true;
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
+    fn loop_props_panel(&mut self, ui: &mut egui::Ui, li: usize, cp: CompPath) {
+        let hl = &self.model.loops[li];
+        let Some(c) = comp_in(hl, cp).cloned() else {
+            self.loop_comp = None;
+            return;
+        };
+        let loop_name = hl.name.clone();
+        let side_label = hl.sides.get(cp.side).map(|s| s.label.clone());
+        let branch = branch_in(hl, cp).map(|b| b.name.clone());
+
+        ui.heading("Loop component");
+        ui.separator();
+        egui::Grid::new("loop_props")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                let mut row = |k: &str, v: String| {
+                    ui.label(RichText::new(k).strong());
+                    ui.label(v);
+                    ui.end_row();
+                };
+                row("Loop", loop_name);
+                if let Some(s) = side_label {
+                    row("Side", s);
+                }
+                if let Some(b) = branch {
+                    row("Branch", b);
+                }
+                row("Class", c.class.clone());
+                row("Name", c.name.clone());
+                if !c.inlet.is_empty() {
+                    row("Inlet node", c.inlet.clone());
+                }
+                if !c.outlet.is_empty() {
+                    row("Outlet node", c.outlet.clone());
+                }
+                if c.found {
+                    row("IDF line", format!("{}", c.line));
+                }
+            });
+        if !c.found && c.class != "Zone" {
+            ui.label(
+                RichText::new("⚠ Object not found in the file.").color(Color32::YELLOW),
+            );
+        }
+
+        if c.class == "Zone" {
+            let zone = self
+                .zones
+                .iter()
+                .find(|z| z.eq_ignore_ascii_case(&c.name))
+                .cloned();
+            if let Some(z) = zone {
+                if ui.button("Show zone in 3D").clicked() {
+                    self.zone_filter = Some(z);
+                    self.tab = Tab::Scene;
+                    self.recompute_visibility();
+                    self.zoom_to_fit();
+                }
+            }
+        }
+        if ui.button("Deselect  (Esc)").clicked() {
+            self.loop_comp = None;
+        }
+
+        if !c.children.is_empty() {
+            egui::CollapsingHeader::new(format!("Referenced objects ({})", c.children.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for ch in &c.children {
+                        egui::CollapsingHeader::new(format!(
+                            "{}  ·  {}  ·  line {}",
+                            ch.name, ch.class, ch.line
+                        ))
+                            .show(ui, |ui| {
+                                egui::ScrollArea::horizontal().id_salt(&ch.name).show(
+                                    ui,
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&ch.raw).monospace().small(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                        );
+                                    },
+                                );
+                            });
+                    }
+                });
+        }
+
+        if c.found {
+            egui::CollapsingHeader::new("Raw IDF")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::both().max_height(400.0).show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(&c.raw).monospace())
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    });
+                });
+        }
+    }
+
+    fn loop_canvas(&mut self, ui: &mut egui::Ui) {
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        let painter = ui.painter().with_clip_rect(rect);
+        let Some(li) = self.loop_sel else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Select a loop from the list",
+                egui::FontId::proportional(16.0),
+                Color32::from_gray(150),
+            );
+            return;
+        };
+
+        // --- pan / zoom ---
+        if response.dragged() {
+            self.loop_pan += response.drag_delta();
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                let old = self.loop_zoom;
+                let new = (old * (scroll * 0.002).exp()).clamp(0.02, 3.0);
+                if let Some(hp) = response.hover_pos() {
+                    let world = (hp - rect.min - self.loop_pan) / old;
+                    self.loop_pan = hp - rect.min - world * new;
+                }
+                self.loop_zoom = new;
+            }
+        }
+
+        let hl = &self.model.loops[li];
+
+        // --- layout (world coordinates) ---
+        let mut layouts = Vec::new();
+        let mut y = 0.0f32;
+        for (si, side) in hl.sides.iter().enumerate() {
+            let l = layout_side(side, si, y);
+            y += l.height + SIDE_GAP;
+            layouts.push(l);
+        }
+        let total_h = (y - SIDE_GAP).max(1.0);
+        let w = layouts.iter().map(|l| l.width).fold(1.0, f32::max);
+        // Mirror every other side so the loop reads as a circuit: supply flows
+        // left→right on top, demand right→left below, with short closure runs.
+        for (i, l) in layouts.iter_mut().enumerate() {
+            if i % 2 == 1 {
+                mirror_layout(l, w);
+            }
+        }
+
+        if self.loop_fit_pending && rect.width() > 0.0 {
+            self.loop_fit_pending = false;
+            let bb = egui::Rect::from_min_max(
+                egui::pos2(-CLOSURE_MARGIN - 40.0, -50.0),
+                egui::pos2(w + CLOSURE_MARGIN + 40.0, total_h + 30.0),
+            );
+            let z = (rect.width() / bb.width())
+                .min(rect.height() / bb.height())
+                .clamp(0.02, 1.2);
+            self.loop_zoom = z;
+            self.loop_pan = (rect.size() - bb.size() * z) / 2.0 - bb.min.to_vec2() * z;
+        }
+
+        let zoom = self.loop_zoom;
+        let pan = self.loop_pan;
+        let ts = |p: egui::Pos2| rect.min + pan + p.to_vec2() * zoom;
+        let tr = |r: egui::Rect| egui::Rect::from_min_max(ts(r.min), ts(r.max));
+
+        // --- draw ---
+        let line_color = Color32::from_gray(130);
+        let stroke = egui::Stroke::new((1.4 * zoom).clamp(0.4, 2.5), line_color);
+        let mut hovered: Option<CompPath> = None;
+        let hover_pos = response.hover_pos();
+
+        for l in &layouts {
+            for seg in &l.lines {
+                let (a, b) = (ts(seg[0]), ts(seg[1]));
+                painter.line_segment([a, b], stroke);
+                flow_arrow(&painter, a, b, zoom, line_color);
+            }
+            for (r, path, _) in &l.bars {
+                let sr = tr(*r);
+                let selected = self.loop_comp == Some(*path);
+                painter.rect_filled(sr, 3.0 * zoom, Color32::from_rgb(115, 135, 165));
+                if selected {
+                    painter.rect_stroke(
+                        sr.expand(1.5),
+                        3.0 * zoom,
+                        egui::Stroke::new(2.0, Color32::WHITE),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                if hover_pos.is_some_and(|p| sr.contains(p)) {
+                    hovered = Some(*path);
+                }
+            }
+            for (r, path) in &l.boxes {
+                let Some(c) = comp_in(hl, *path) else { continue };
+                let sr = tr(*r);
+                let color = class_color(&c.class);
+                let selected = self.loop_comp == Some(*path);
+                let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 42);
+                painter.rect_filled(sr, 5.0 * zoom, fill);
+                let (sw, sc) = if selected {
+                    (2.2, Color32::WHITE)
+                } else {
+                    (1.2 * zoom.clamp(0.4, 1.5), color)
+                };
+                painter.rect_stroke(
+                    sr,
+                    5.0 * zoom,
+                    egui::Stroke::new(sw, sc),
+                    egui::StrokeKind::Inside,
+                );
+                let class_px = 9.0 * zoom;
+                if class_px > 4.5 {
+                    painter.text(
+                        egui::pos2(sr.center().x, sr.top() + 5.0 * zoom),
+                        egui::Align2::CENTER_TOP,
+                        trunc(&c.class, 36),
+                        egui::FontId::proportional(class_px),
+                        Color32::from_gray(160),
+                    );
+                }
+                let name_px = 11.5 * zoom;
+                if name_px > 5.0 {
+                    painter.text(
+                        egui::pos2(sr.center().x, sr.bottom() - 8.0 * zoom),
+                        egui::Align2::CENTER_BOTTOM,
+                        trunc(&c.name, 28),
+                        egui::FontId::proportional(name_px),
+                        Color32::from_gray(230),
+                    );
+                }
+                if hover_pos.is_some_and(|p| sr.contains(p)) {
+                    hovered = Some(*path);
+                }
+            }
+            for (pos, right, text, size) in &l.labels {
+                let px = size * zoom;
+                if px < 5.0 {
+                    continue;
+                }
+                let anchor = if *right {
+                    egui::Align2::RIGHT_BOTTOM
+                } else {
+                    egui::Align2::LEFT_BOTTOM
+                };
+                let font = if *size <= 9.5 {
+                    egui::FontId::monospace(px)
+                } else {
+                    egui::FontId::proportional(px)
+                };
+                painter.text(ts(*pos), anchor, text, font, Color32::from_gray(140));
+            }
+        }
+
+        // Dashed closure runs between consecutive sides (the "pipe" that turns
+        // the two half-loops into a circuit).
+        for i in 0..layouts.len().saturating_sub(1) {
+            let (a, b) = (&layouts[i], &layouts[i + 1]);
+            let route_x = if i % 2 == 0 {
+                w + CLOSURE_MARGIN
+            } else {
+                -CLOSURE_MARGIN
+            };
+            let pts = [
+                a.outlet,
+                egui::pos2(route_x, a.outlet.y),
+                egui::pos2(route_x, b.inlet.y),
+                b.inlet,
+            ];
+            let screen: Vec<egui::Pos2> = pts.iter().map(|&p| ts(p)).collect();
+            painter.extend(egui::Shape::dashed_line(
+                &screen,
+                stroke,
+                8.0 * zoom.max(0.5),
+                6.0 * zoom.max(0.5),
+            ));
+        }
+
+        // --- hover / click ---
+        if let Some(path) = hovered {
+            ui.ctx()
+                .output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+            if let Some(c) = comp_in(hl, path) {
+                let (class, name, inlet, outlet) = (
+                    c.class.clone(),
+                    c.name.clone(),
+                    c.inlet.clone(),
+                    c.outlet.clone(),
+                );
+                response.clone().on_hover_ui_at_pointer(|ui| {
+                    ui.strong(name);
+                    ui.label(RichText::new(class).weak());
+                    if !inlet.is_empty() {
+                        ui.label(RichText::new(format!("in:  {inlet}")).monospace().small());
+                    }
+                    if !outlet.is_empty() {
+                        ui.label(RichText::new(format!("out: {outlet}")).monospace().small());
+                    }
+                });
+            }
+        }
+        if response.clicked() {
+            self.loop_comp = hovered;
+        }
+
+        // --- overlays ---
+        painter.text(
+            rect.left_top() + egui::vec2(10.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            format!("{}  ·  {} loop", hl.name, hl.kind.label()),
+            egui::FontId::proportional(15.0),
+            Color32::from_gray(220),
+        );
+        painter.text(
+            rect.left_bottom() + egui::vec2(8.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            "drag: pan · scroll: zoom · click: component details · F: fit",
+            egui::FontId::proportional(12.0),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 140),
+        );
     }
 
     fn properties_panel(&mut self, ui: &mut egui::Ui, sel: usize) {
@@ -1080,7 +1598,37 @@ impl App {
                 let d = self.demo.as_mut().unwrap();
                 shoot(d, ctx, "06-color-problems.png");
             }
-            61.. => {
+            63 => {
+                // Loop schematic: pick the loop with the most parallel paths.
+                self.tab = Tab::Loops;
+                self.loop_sel = self
+                    .model
+                    .loops
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, l)| {
+                        (l.kind == LoopKind::Plant) as usize * 1000
+                            + l.sides.iter().map(|s| s.parallel.len()).sum::<usize>()
+                    })
+                    .map(|(i, _)| i);
+                self.loop_comp = self.loop_sel.and_then(|i| {
+                    let p = CompPath {
+                        side: 0,
+                        seg: Seg::SeriesIn,
+                        branch: 0,
+                        comp: 0,
+                    };
+                    comp_in(&self.model.loops[i], p).is_some().then_some(p)
+                });
+                self.loop_fit_pending = true;
+            }
+            72 => {
+                if self.loop_sel.is_some() {
+                    let d = self.demo.as_mut().unwrap();
+                    shoot(d, ctx, "07-hvac-loop.png");
+                }
+            }
+            75.. => {
                 let d = self.demo.as_mut().unwrap();
                 if d.pending_shots == 0 && !d.closing {
                     d.closing = true;
@@ -1093,9 +1641,351 @@ impl App {
     }
 }
 
+// --- loop schematic layout (world coordinates, pixels at zoom 1) ------------
+
+const BOX_W: f32 = 180.0;
+const BOX_H: f32 = 48.0;
+const GAP_X: f32 = 46.0;
+const GAP_Y: f32 = 26.0;
+const BAR_W: f32 = 10.0;
+const STUB: f32 = 60.0;
+const SIDE_GAP: f32 = 120.0;
+const CLOSURE_MARGIN: f32 = 50.0;
+
+struct SideLayout {
+    boxes: Vec<(egui::Rect, CompPath)>,
+    /// Splitter/mixer bars: rect, path, name (for the tooltip).
+    bars: Vec<(egui::Rect, CompPath, String)>,
+    lines: Vec<[egui::Pos2; 2]>,
+    /// (anchor, right-aligned?, text, font size at zoom 1)
+    labels: Vec<(egui::Pos2, bool, String, f32)>,
+    width: f32,
+    height: f32,
+    inlet: egui::Pos2,
+    outlet: egui::Pos2,
+}
+
+/// Place one side left-to-right: inlet stub, series branches, splitter bar,
+/// stacked parallel branches, mixer bar, series branches, outlet stub.
+fn layout_side(side: &Side, side_idx: usize, y_top: f32) -> SideLayout {
+    let n_rows = side.parallel.len();
+    let rows_h = if n_rows > 0 {
+        n_rows as f32 * (BOX_H + GAP_Y) - GAP_Y
+    } else {
+        0.0
+    };
+    let height = rows_h.max(BOX_H);
+    let cy = y_top + height / 2.0;
+    let row_cy =
+        |k: usize| y_top + (height - rows_h) / 2.0 + k as f32 * (BOX_H + GAP_Y) + BOX_H / 2.0;
+
+    let mut out = SideLayout {
+        boxes: Vec::new(),
+        bars: Vec::new(),
+        lines: Vec::new(),
+        labels: Vec::new(),
+        width: 0.0,
+        height,
+        inlet: egui::pos2(0.0, cy),
+        outlet: egui::pos2(0.0, cy),
+    };
+
+    let mut x = STUB;
+    let mut px = 0.0f32; // where the incoming flow line currently ends
+
+    let place_series = |branches: &[BranchView],
+                            seg: Seg,
+                            x: &mut f32,
+                            px: &mut f32,
+                            out: &mut SideLayout| {
+        for (bi, b) in branches.iter().enumerate() {
+            for ci in 0..b.components.len() {
+                out.lines.push([egui::pos2(*px, cy), egui::pos2(*x, cy)]);
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(*x, cy - BOX_H / 2.0),
+                    egui::vec2(BOX_W, BOX_H),
+                );
+                out.boxes.push((
+                    r,
+                    CompPath {
+                        side: side_idx,
+                        seg,
+                        branch: bi,
+                        comp: ci,
+                    },
+                ));
+                *px = *x + BOX_W;
+                *x = *px + GAP_X;
+            }
+        }
+    };
+
+    place_series(&side.series_in, Seg::SeriesIn, &mut x, &mut px, &mut out);
+
+    if n_rows > 0 {
+        let bar_top = row_cy(0).min(cy) - 12.0;
+        let bar_bot = row_cy(n_rows - 1).max(cy) + 12.0;
+        out.lines.push([egui::pos2(px, cy), egui::pos2(x, cy)]);
+        let sp_name = side
+            .splitter
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Splitter".to_string());
+        out.bars.push((
+            egui::Rect::from_min_max(egui::pos2(x, bar_top), egui::pos2(x + BAR_W, bar_bot)),
+            CompPath {
+                side: side_idx,
+                seg: Seg::Splitter,
+                branch: 0,
+                comp: 0,
+            },
+            sp_name,
+        ));
+        let bar_right = x + BAR_W;
+        let row_x0 = bar_right + GAP_X;
+        let mut row_end = vec![bar_right; n_rows];
+        let mut max_right = row_x0;
+        for (bi, b) in side.parallel.iter().enumerate() {
+            let ry = row_cy(bi);
+            let mut rx = row_x0;
+            let mut rpx = bar_right;
+            for ci in 0..b.components.len() {
+                out.lines.push([egui::pos2(rpx, ry), egui::pos2(rx, ry)]);
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(rx, ry - BOX_H / 2.0),
+                    egui::vec2(BOX_W, BOX_H),
+                );
+                out.boxes.push((
+                    r,
+                    CompPath {
+                        side: side_idx,
+                        seg: Seg::Parallel,
+                        branch: bi,
+                        comp: ci,
+                    },
+                ));
+                rpx = rx + BOX_W;
+                rx = rpx + GAP_X;
+            }
+            row_end[bi] = rpx;
+            max_right = max_right.max(rpx);
+        }
+        let mx_x = max_right + GAP_X;
+        for (bi, &re) in row_end.iter().enumerate() {
+            out.lines
+                .push([egui::pos2(re, row_cy(bi)), egui::pos2(mx_x, row_cy(bi))]);
+        }
+        let mx_name = side
+            .mixer
+            .as_ref()
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| "Mixer".to_string());
+        out.bars.push((
+            egui::Rect::from_min_max(
+                egui::pos2(mx_x, bar_top),
+                egui::pos2(mx_x + BAR_W, bar_bot),
+            ),
+            CompPath {
+                side: side_idx,
+                seg: Seg::Mixer,
+                branch: 0,
+                comp: 0,
+            },
+            mx_name,
+        ));
+        px = mx_x + BAR_W;
+        x = px + GAP_X;
+    }
+
+    place_series(&side.series_out, Seg::SeriesOut, &mut x, &mut px, &mut out);
+
+    out.width = px + STUB;
+    out.lines
+        .push([egui::pos2(px, cy), egui::pos2(out.width, cy)]);
+    out.outlet = egui::pos2(out.width, cy);
+
+    let mut title = side.label.clone();
+    if n_rows > 1 {
+        title.push_str(&format!("  ·  {n_rows} parallel paths"));
+    }
+    out.labels
+        .push((egui::pos2(0.0, y_top - 12.0), false, title, 13.0));
+    out
+}
+
+/// Flip a side horizontally within total width `w` so its flow reads
+/// right-to-left (used for the demand side of the circuit).
+fn mirror_layout(l: &mut SideLayout, w: f32) {
+    let flip_rect = |r: &mut egui::Rect| {
+        *r = egui::Rect::from_min_max(
+            egui::pos2(w - r.max.x, r.min.y),
+            egui::pos2(w - r.min.x, r.max.y),
+        );
+    };
+    for (r, _) in &mut l.boxes {
+        flip_rect(r);
+    }
+    for (r, _, _) in &mut l.bars {
+        flip_rect(r);
+    }
+    for seg in &mut l.lines {
+        seg[0].x = w - seg[0].x;
+        seg[1].x = w - seg[1].x;
+    }
+    for (p, right, _, _) in &mut l.labels {
+        p.x = w - p.x;
+        *right = !*right;
+    }
+    l.inlet.x = w - l.inlet.x;
+    l.outlet.x = w - l.outlet.x;
+}
+
+/// Arrowhead at the midpoint of a flow line (screen coordinates).
+fn flow_arrow(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2, zoom: f32, color: Color32) {
+    let v = b - a;
+    let len = v.length();
+    if len < 26.0 * zoom {
+        return;
+    }
+    let d = v / len;
+    let n = egui::vec2(-d.y, d.x);
+    let s = (5.0 * zoom).clamp(1.5, 7.0);
+    let tip = a + v * 0.5 + d * s;
+    let base = a + v * 0.5 - d * s;
+    let stroke = egui::Stroke::new((1.4 * zoom).clamp(0.4, 2.5), color);
+    painter.line_segment([tip, base + n * s], stroke);
+    painter.line_segment([tip, base - n * s], stroke);
+}
+
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+fn class_color(class: &str) -> Color32 {
+    let c = class.to_ascii_lowercase();
+    let (r, g, b) = if c == "zone" {
+        (110, 185, 110)
+    } else if c == "?" {
+        (220, 90, 90)
+    } else if c.contains("unitary") || c.contains("furnace") {
+        (225, 170, 90)
+    } else if c.contains("outdoorairsystem") {
+        (120, 180, 235)
+    } else if c.contains("airterminal") || c.contains("airdistribution") {
+        (170, 190, 100)
+    } else if c.contains("chiller") {
+        (95, 190, 220)
+    } else if c.contains("boiler") || c.contains("coil:heating") || c.contains("baseboard") {
+        (230, 110, 100)
+    } else if c.contains("tower") || c.contains("fluidcooler") {
+        (95, 185, 170)
+    } else if c.contains("pump") {
+        (160, 120, 230)
+    } else if c.contains("coil:cooling") {
+        (100, 145, 235)
+    } else if c.contains("fan") {
+        (235, 160, 70)
+    } else if c.contains("waterheater") {
+        (215, 130, 170)
+    } else if c.contains("humidifier") {
+        (110, 200, 215)
+    } else if c.contains("heatexchanger") {
+        (200, 160, 120)
+    } else if c.contains("pipe") || c.contains("duct") {
+        (150, 150, 155)
+    } else {
+        (150, 155, 165)
+    };
+    Color32::from_rgb(r, g, b)
+}
+
 fn cardinal(azimuth: f64) -> &'static str {
     const DIRS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     DIRS[(((azimuth + 22.5) / 45.0) as usize) % 8]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comp(class: &str, name: &str) -> LoopPart {
+        LoopPart {
+            class: class.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn branch(name: &str, comps: &[(&str, &str)]) -> BranchView {
+        BranchView {
+            name: name.to_string(),
+            components: comps.iter().map(|(c, n)| comp(c, n)).collect(),
+        }
+    }
+
+    /// A CHW-style side: pump → splitter → {chiller · 2-comp path · bypass} →
+    /// mixer → outlet pipe. Boxes must not overlap and flow must be monotonic.
+    #[test]
+    fn side_layout_no_overlaps_and_mirrors() {
+        let side = Side {
+            label: "Supply side".to_string(),
+            inlet_node: "in".to_string(),
+            outlet_node: "out".to_string(),
+            series_in: vec![branch("pump", &[("Pump:ConstantSpeed", "P1")])],
+            parallel: vec![
+                branch("ch", &[("Chiller:Electric:EIR", "CH1")]),
+                branch(
+                    "hx",
+                    &[
+                        ("HeatExchanger:FluidToFluid", "HX1"),
+                        ("Pipe:Adiabatic", "HX out pipe"),
+                    ],
+                ),
+                branch("byp", &[("Pipe:Adiabatic", "Bypass")]),
+            ],
+            series_out: vec![branch("outb", &[("Pipe:Adiabatic", "Out pipe")])],
+            splitter: Some(comp("Connector:Splitter", "S")),
+            mixer: Some(comp("Connector:Mixer", "M")),
+        };
+        let l = layout_side(&side, 0, 0.0);
+        assert_eq!(l.boxes.len(), 6);
+        assert_eq!(l.bars.len(), 2);
+        for (i, (a, _)) in l.boxes.iter().enumerate() {
+            for (b, _) in &l.boxes[i + 1..] {
+                assert!(!a.intersects(*b), "boxes overlap: {a:?} vs {b:?}");
+            }
+            for (bar, _, _) in &l.bars {
+                assert!(!a.intersects(*bar), "box {a:?} overlaps bar {bar:?}");
+            }
+        }
+        // Splitter bar sits right of the series-in box, mixer right of every
+        // parallel box, outlet stub ends the side.
+        let (sp, mx) = (&l.bars[0].0, &l.bars[1].0);
+        assert!(sp.min.x >= l.boxes[0].0.max.x);
+        for (r, p) in &l.boxes {
+            if p.seg == Seg::Parallel {
+                assert!(r.max.x <= mx.min.x);
+            }
+        }
+        assert_eq!(l.outlet.x, l.width);
+        assert_eq!(l.inlet.x, 0.0);
+
+        let (w, old_outlet) = (l.width + 100.0, l.outlet.x);
+        let mut m = l;
+        mirror_layout(&mut m, w);
+        assert_eq!(m.inlet.x, w);
+        assert_eq!(m.outlet.x, w - old_outlet);
+        for (i, (a, _)) in m.boxes.iter().enumerate() {
+            for (b, _) in &m.boxes[i + 1..] {
+                assert!(!a.intersects(*b), "mirrored boxes overlap");
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1112,10 +2002,16 @@ impl eframe::App for App {
                 return;
             }
             if i.key_pressed(egui::Key::F) {
-                self.zoom_to_fit();
+                match self.tab {
+                    Tab::Scene => self.zoom_to_fit(),
+                    Tab::Loops => self.loop_fit_pending = true,
+                }
             }
             if i.key_pressed(egui::Key::Escape) {
-                self.selected = None;
+                match self.tab {
+                    Tab::Scene => self.selected = None,
+                    Tab::Loops => self.loop_comp = None,
+                }
             }
             if i.key_pressed(egui::Key::N) {
                 self.select_next_problem();
@@ -1127,19 +2023,37 @@ impl eframe::App for App {
             .default_size(300.0)
             .show(ui, |ui| self.left_panel(ui));
 
-        if let Some(sel) = self.selected {
-            egui::Panel::right(egui::Id::new("props"))
-                .resizable(true)
-                .default_size(380.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| self.properties_panel(ui, sel));
-                });
+        match self.tab {
+            Tab::Scene => {
+                if let Some(sel) = self.selected {
+                    egui::Panel::right(egui::Id::new("props"))
+                        .resizable(true)
+                        .default_size(380.0)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.properties_panel(ui, sel));
+                        });
+                }
+                egui::CentralPanel::default_margins()
+                    .frame(egui::Frame::new().fill(Color32::from_rgb(23, 26, 31)))
+                    .show(ui, |ui| self.viewport(ui));
+            }
+            Tab::Loops => {
+                if let (Some(li), Some(cp)) = (self.loop_sel, self.loop_comp) {
+                    egui::Panel::right(egui::Id::new("loop_props"))
+                        .resizable(true)
+                        .default_size(420.0)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.loop_props_panel(ui, li, cp));
+                        });
+                }
+                egui::CentralPanel::default_margins()
+                    .frame(egui::Frame::new().fill(Color32::from_rgb(23, 26, 31)))
+                    .show(ui, |ui| self.loop_canvas(ui));
+            }
         }
-
-        egui::CentralPanel::default_margins()
-            .frame(egui::Frame::new().fill(Color32::from_rgb(23, 26, 31)))
-            .show(ui, |ui| self.viewport(ui));
     }
 }

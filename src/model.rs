@@ -235,9 +235,11 @@ pub struct Surface {
     pub base_surface: Option<usize>,
 }
 
+#[derive(Default)]
 pub struct Model {
     pub surfaces: Vec<Surface>,
     pub warnings: Vec<String>,
+    pub loops: Vec<crate::loops::HvacLoop>,
 }
 
 struct ZoneInfo {
@@ -471,7 +473,11 @@ pub fn build(objects: &[IdfObject]) -> Model {
         ));
     }
 
-    let mut model = Model { surfaces, warnings };
+    let mut model = Model {
+        surfaces,
+        warnings,
+        loops: crate::loops::build(objects),
+    };
     crate::analysis::analyze(&mut model, &zone_volumes);
     model
 }
